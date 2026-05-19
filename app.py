@@ -102,4 +102,30 @@ col1, col2 = st.columns(2)
 with col1:
     shadow_file = st.file_uploader("1. Lataa varjokuva (PNG)", type=["png"])
 with col2:
-    product_file = st.file_uploader("2. Lataa tuotek
+    product_file = st.file_uploader("2. Lataa tuotekuva", type=["png", "jpg", "jpeg"])
+
+if shadow_file and product_file:
+    try:
+        shadow_image = Image.open(shadow_file)
+        product_image = Image.open(product_file)
+        
+        with st.spinner("Prosessoidaan kuvaa..."):
+            final_image = apply_shadow(product_image, shadow_image)
+            
+            st.subheader("Valmis kuva")
+            st.image(final_image, use_container_width=True)
+            
+            # Muutetaan kuva takaisin tavuiksi latausta varten
+            buf = io.BytesIO()
+            final_image.save(buf, format="PNG")
+            byte_im = buf.getvalue()
+            
+            st.download_button(
+                label="⬇️ Lataa valmis kuva",
+                data=byte_im,
+                file_name="varjostettu_tuote.png",
+                mime="image/png",
+                use_container_width=True
+            )
+    except Exception as e:
+        st.error(f"Virhe kuvan käsittelyssä: {e}")
