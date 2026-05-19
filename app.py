@@ -1,3 +1,11 @@
+import streamlit as st
+import numpy as np
+from PIL import Image
+import io
+
+# Asetetaan sivun otsikko ja leveys
+st.set_page_config(page_title="Varjoautomaatio", page_icon="🌤️", layout="centered")
+
 def find_bottom_left_corner(image):
     """
     Etsii esineen vasemman alakulman rajaamalla tarkastelun esineen alimpaan 20 prosenttiin
@@ -53,18 +61,14 @@ def apply_shadow(product_img, shadow_img):
     target_x, target_y = corner_point
     
     # SÄÄDÖT: Voit muuttaa näitä prosentteja, jos varjo näyttää olevan liikaa irti esineestä.
-    # Esimerkiksi 0.1 tarkoittaa, että varjo limittyy 10% leveydestään esineen alle.
     overlap_x_percent = 0.15 
     overlap_y_percent = 0.30
     
-    # Lasketaan varjon sijainti. Oletuksena varjo sijoitetaan esineen vasemmalle puolelle
-    # siten, että varjon oikea reuna koskettaa/limittyy löydettyyn kulmaan.
+    # Lasketaan varjon sijainti. 
     shadow_x = target_x - shadow_img.width + int(shadow_img.width * overlap_x_percent)
-    
-    # Varjon pystysuuntainen sijoitus. Säädetään niin, että varjon alaosa on linjassa kulman kanssa.
     shadow_y = target_y - shadow_img.height + int(shadow_img.height * overlap_y_percent)
     
-    # Lasketaan kankaan koko ja offset samalla tavalla kuin aiemmin
+    # Lasketaan kankaan koko ja offset
     max_x = max(product_img.width, shadow_x + shadow_img.width)
     max_y = max(product_img.height, shadow_y + shadow_img.height)
     min_x = min(0, shadow_x)
@@ -87,3 +91,15 @@ def apply_shadow(product_img, shadow_img):
         canvas = canvas.crop(bbox)
         
     return canvas
+
+# --- KÄYTTÖLIITTYMÄ (UI) ---
+
+st.title("Varjogeneraattori 🌤️")
+st.markdown("Pudota puutteellinen tuotekuva alle. Järjestelmä etsii esineen vasemman alakulman ja sijoittaa vakiovarjon sen alle automaattisesti.")
+
+# Ladataan tiedostot
+col1, col2 = st.columns(2)
+with col1:
+    shadow_file = st.file_uploader("1. Lataa varjokuva (PNG)", type=["png"])
+with col2:
+    product_file = st.file_uploader("2. Lataa tuotek
