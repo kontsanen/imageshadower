@@ -12,6 +12,7 @@ Core algorithm:
   5. Trim transparent margins and return the final composite.
 """
 
+import base64
 import io
 import os
 from typing import Optional, Tuple
@@ -22,7 +23,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="ShadowDrop — Harvia Labs",
+    page_title="Cast-a-shadow beta — Harvia Labs",
     page_icon="🌤️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -61,9 +62,20 @@ STYLE = """
   section[data-testid="stSidebar"]        { background-color: var(--bg-sidebar);
                                             border-right: 1px solid var(--border); }
 
-  /* Slider thumb + track */
-  .stSlider > div > div > div > div       { background-color: var(--red) !important; }
-  .stSlider [data-baseweb="slider"] > div:last-child { background-color: var(--red) !important; }
+  /* Slider: thumb knob + filled track red; suppress all hover/focus backgrounds */
+  .stSlider [role="slider"]                      { background-color: var(--red) !important;
+                                                   border-color:     var(--red) !important; }
+  .stSlider > div > div > div > div              { background-color: var(--red) !important; }
+  /* The last-child of [data-baseweb="slider"] is the tick/label bar — keep it transparent
+     so it never shows as an ugly red box on hover */
+  .stSlider [data-baseweb="slider"] > div:last-child { background-color: transparent !important; }
+  /* Kill focus outlines and hover rings */
+  .stSlider [role="slider"]:focus,
+  .stSlider [role="slider"]:focus-visible        { outline: none !important;
+                                                   box-shadow: none !important; }
+  .stSlider > div:focus-within,
+  .stSlider [data-baseweb="slider"]:focus-within { background-color: transparent !important;
+                                                   outline: none !important; }
 
   /* Buttons & download */
   .stButton > button,
@@ -81,21 +93,198 @@ STYLE = """
   .stButton > button:hover,
   .stDownloadButton > button:hover { background-color: var(--red-h) !important; }
 
-  /* File uploader drop zone */
+  /* File uploader: full-zone clickable drop area (no prominent button) */
   [data-testid="stFileUploaderDropzone"] {
-    background-color: var(--bg-card)   !important;
+    position:         relative !important;
+    background-color: var(--bg-card) !important;
     border:           1.5px dashed var(--border) !important;
-    border-radius:    10px             !important;
+    border-radius:    10px !important;
+    min-height:       110px !important;
+    display:          flex !important;
+    align-items:      center !important;
+    justify-content:  center !important;
+    cursor:           pointer !important;
+    transition:       border-color 0.15s, background-color 0.15s !important;
+  }
+  [data-testid="stFileUploaderDropzone"]:hover {
+    border-color:     var(--red) !important;
+    background-color: rgba(204, 0, 0, 0.03) !important;
+  }
+  /* Stretch the Browse-files button to fill the whole zone so anywhere is clickable.
+     Background matches the dropzone so it covers the default Streamlit instructions text. */
+  [data-testid="stFileUploaderDropzone"] button {
+    position:         absolute !important;
+    inset:            0 !important;
+    z-index:          1 !important;
+    width:            100% !important;
+    height:           100% !important;
+    margin:           0 !important;
+    padding:          0 !important;
+    background:       var(--bg-card) !important;
+    border:           none !important;
+    border-radius:    10px !important;
+    box-shadow:       none !important;
+    color:            var(--muted) !important;
+    font-size:        0.82rem !important;
+    font-weight:      500 !important;
+    letter-spacing:   0.05em !important;
+    text-transform:   uppercase !important;
+    cursor:           pointer !important;
+    display:          flex !important;
+    align-items:      center !important;
+    justify-content:  center !important;
+    gap:              0.45rem !important;
+    transition:       color 0.15s, background-color 0.15s !important;
+  }
+  [data-testid="stFileUploaderDropzone"]:hover button {
+    background:       rgba(204, 0, 0, 0.03) !important;
+    color:            var(--red) !important;
+  }
+  /* File size limit text: pin to bottom-center of the drop zone.
+     Target both <small> and any <span> Streamlit may use for this text. */
+  [data-testid="stFileUploaderDropzone"] small,
+  [data-testid="stFileUploaderDropzone"] [data-testid="stFileUploadDropInstructions"] small,
+  [data-testid="stFileUploaderDropzone"] > div > small,
+  [data-testid="stFileUploaderDropzone"] > div > div > small {
+    position:       absolute !important;
+    bottom:         0.6rem !important;
+    left:           0 !important;
+    right:          0 !important;
+    display:        block !important;
+    text-align:     center !important;
+    color:          var(--muted) !important;
+    font-size:      0.70rem !important;
+    letter-spacing: 0.02em !important;
+    pointer-events: none !important;
+    z-index:        3 !important;
   }
 
-  /* Result card wrapper */
+  /* Lock sidebar open — override the CSS transform Streamlit uses to slide it off-screen */
+  section[data-testid="stSidebar"] {
+    transform:  translateX(0) !important;
+    display:    flex !important;
+    visibility: visible !important;
+    min-width:  280px !important;
+    width:      280px !important;
+  }
+
+  /* Hide the sidebar CLOSE button (the × inside the open sidebar) */
+  [data-testid="stSidebarCollapseButton"] { display: none !important; }
+
+  /* Expand button — keep visible in case Streamlit still renders it */
+  [data-testid="stSidebarCollapsedControl"],
+  [data-testid="collapsedControl"] {
+    position:         fixed !important;
+    left:             0 !important;
+    top:              50vh !important;
+    transform:        translateY(-50%) !important;
+    z-index:          9999 !important;
+    display:          flex !important;
+    visibility:       visible !important;
+    opacity:          1 !important;
+    width:            1.8rem !important;
+    height:           3rem !important;
+    background-color: var(--red) !important;
+    border-radius:    0 8px 8px 0 !important;
+    align-items:      center !important;
+    justify-content:  center !important;
+    cursor:           pointer !important;
+    box-shadow:       2px 0 6px rgba(0,0,0,0.15) !important;
+  }
+  [data-testid="stSidebarCollapsedControl"] button,
+  [data-testid="collapsedControl"] button {
+    background:      transparent !important;
+    border:          none !important;
+    width:           100% !important;
+    height:          100% !important;
+    display:         flex !important;
+    align-items:     center !important;
+    justify-content: center !important;
+    padding:         0 !important;
+  }
+  [data-testid="stSidebarCollapsedControl"] svg,
+  [data-testid="collapsedControl"] svg {
+    fill:  white !important;
+    color: white !important;
+  }
+
+  /* Reduce main content block padding */
+  .block-container {
+    padding-top:   1rem !important;
+    padding-left:  1.2rem !important;
+    padding-right: 1.2rem !important;
+    max-width:     none  !important;
+  }
+
+  /* Spinner — text dark, ring uses brand muted tone.
+     Streamlit's spinner SVG uses stroke="currentColor", so setting color on the
+     SVG element propagates to the arc via currentColor. */
+  [data-testid="stSpinner"],
+  [data-testid="stSpinner"] > div,
+  [data-testid="stSpinner"] p,
+  [data-testid="stSpinner"] span,
+  .stSpinner, .stSpinner p, .stSpinner span { color: var(--text) !important; }
+  /* The SVG ring: force currentColor to muted so the arc is visible */
+  [data-testid="stSpinner"] svg             { color:  var(--muted) !important; }
+  [data-testid="stSpinner"] svg *           { stroke: var(--muted) !important;
+                                              color:  var(--muted) !important; }
+
+  /* Info / warning / error boxes — replace Streamlit blue with brand palette */
+  [data-testid="stAlert"] {
+    background-color: var(--bg-card)   !important;
+    border:           1px solid var(--border) !important;
+    border-left:      3px solid var(--muted) !important;
+    border-radius:    8px !important;
+    color:            var(--muted) !important;
+  }
+  [data-testid="stAlert"] p { color: var(--muted) !important; }
+  [data-testid="stAlert"] svg { display: none !important; }
+
+  /* Upload columns: align tops */
+  [data-testid="stHorizontalBlock"] { align-items: flex-start !important; }
+
+  /* Sidebar: fix caption/label text colour (appears white by default) */
+  section[data-testid="stSidebar"] p,
+  section[data-testid="stSidebar"] small,
+  section[data-testid="stSidebar"] .stCaption,
+  section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+    color: var(--muted) !important;
+  }
+
+  /* Sidebar top space: set the content wrapper's padding-top to match the
+     sidebar's natural left padding so the logo has equal breathing room top & left */
+  [data-testid="stSidebarContent"] {
+    padding-top: 1rem !important;
+  }
+
+  /* Sidebar spacing: tighten dividers and caption gaps only; leave slider
+     containers with their natural spacing so nothing overlaps */
+  section[data-testid="stSidebar"] hr {
+    margin: 0.4rem 0 !important;
+  }
+  section[data-testid="stSidebar"] .section-label {
+    margin-bottom: 0.15rem !important;
+  }
+  section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
+    margin-top: 0 !important;
+  }
+
+  /* Sidebar logo image: no extra Streamlit image padding */
+  section[data-testid="stSidebar"] [data-testid="stImage"] {
+    margin-bottom: 0.15rem !important;
+    margin-top:    0 !important;
+  }
+
+  /* Result card wrapper — label-only box above the output image */
   .result-card {
     background:    var(--bg-card);
     border:        1px solid var(--border);
     border-radius: 12px;
-    padding:       1.5rem;
-    margin-top:    1rem;
+    padding:       0.9rem 1.5rem;
+    margin-top:    2rem;
+    margin-bottom: 1.25rem;   /* gap between label card and image below */
   }
+
 
   /* Reusable label style (uppercase track) */
   .section-label {
@@ -121,6 +310,32 @@ STYLE = """
   .chip { display:inline-block; background:var(--chip-bg); border:1px solid var(--border);
           border-radius:20px; padding:0.15rem 0.6rem; font-size:0.74rem;
           font-weight:500; color:var(--text); }
+
+  /* Expander — override Streamlit's default near-black header */
+  [data-testid="stExpander"] > details {
+    background-color: var(--bg-card) !important;
+    border:           1px solid var(--border) !important;
+    border-radius:    8px !important;
+  }
+  [data-testid="stExpander"] summary,
+  [data-testid="stExpander"] summary p,
+  [data-testid="stExpander"] summary span,
+  .streamlit-expanderHeader {
+    background-color: var(--bg-card) !important;
+    color:            var(--text)    !important;
+  }
+  [data-testid="stExpanderToggleIcon"] svg { color: var(--muted) !important; }
+
+  /* All text inside expander content */
+  [data-testid="stExpander"] p,
+  [data-testid="stExpander"] strong,
+  [data-testid="stExpander"] b {
+    color: var(--text) !important;
+  }
+
+  /* Global caption colour (Image size lines, etc.) */
+  .stCaption p,
+  [data-testid="stCaptionContainer"] p { color: var(--muted) !important; }
 
   /* Hide Streamlit chrome */
   #MainMenu, footer, header { visibility:hidden; }
@@ -652,21 +867,40 @@ def load_default_shadow() -> Optional[Image.Image]:
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
+LOGO_FILE = "harvia_labs_red.png"
+
+@st.cache_data
+def _logo_b64() -> str:
+    """Base64-encode the Harvia Labs logo once; cached across reruns."""
+    if os.path.exists(LOGO_FILE):
+        with open(LOGO_FILE, "rb") as fh:
+            return base64.b64encode(fh.read()).decode()
+    return ""
+
+
+def _logo_img(height_px: int = 52, style: str = "") -> str:
+    """Return an <img> tag for the Harvia Labs logo, or empty string if missing."""
+    b64 = _logo_b64()
+    if not b64:
+        return ""
+    return (
+        f'<img src="data:image/png;base64,{b64}" '
+        f'style="height:{height_px}px;width:auto;{style}" alt="Harvia Labs">'
+    )
+
+
 def render_sidebar() -> Tuple[float, int, int, int, bool, str, int]:
     """Render sidebar controls; return (shadow_scale, offset_x, offset_y, bg_tolerance, add_bg, bg_hex, margin_px)."""
     with st.sidebar:
         st.markdown(
-            '<div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:1rem;">'
-            '<div class="logo-box" style="font-size:0.85rem;padding:0.25rem 0.5rem;">HARVIA</div>'
-            '<div class="logo-sub">Labs</div>'
-            '</div>',
+            f'<div style="margin-bottom:0.6rem;">{_logo_img(height_px=46)}</div>',
             unsafe_allow_html=True,
         )
 
         st.markdown('<div class="section-label">Shadow Scale</div>', unsafe_allow_html=True)
         shadow_scale = st.slider(
             "shadow_scale",
-            min_value=0.1, max_value=1.5, value=0.7, step=0.025,
+            min_value=0.1, max_value=1.5, value=0.5, step=0.025,
             help="Shadow width as a multiple of the product's bounding-box width.",
             label_visibility="collapsed",
         )
@@ -725,21 +959,18 @@ def render_sidebar() -> Tuple[float, int, int, int, bool, str, int]:
 
 
 def render_header() -> None:
+    logo = _logo_img(height_px=58, style="display:block;")
     st.markdown(
-        '<div class="header-bar" style="align-items:flex-end;gap:1.1rem;">'
-        '  <div style="flex-shrink:0;">'
-        '    <div class="logo-box" style="font-size:1.55rem;padding:0.35rem 0.75rem;'
-        '         letter-spacing:0.08em;">HARVIA</div>'
-        '    <div class="logo-sub" style="font-size:0.58rem;letter-spacing:0.18em;'
-        '         margin-top:3px;">LABS</div>'
-        '  </div>'
-        '  <div style="border-left:2px solid var(--border);padding-left:1rem;">'
-        '    <p class="app-title" style="font-size:1.65rem;margin:0;line-height:1.1;">'
-        '      ShadowDrop</p>'
-        '    <p style="font-size:0.78rem;color:var(--muted);margin:0.2rem 0 0;">'
-        '      Automated perspective-shadow compositing for product images</p>'
-        '  </div>'
-        '</div>',
+        f'<div class="header-bar" style="align-items:center;gap:1.2rem;margin-bottom:1.6rem;">'
+        f'  <div style="flex-shrink:0;">{logo}</div>'
+        f'  <div style="border-left:2px solid var(--border);padding-left:1.1rem;">'
+        f'    <p class="app-title" style="font-size:1.6rem;margin:0;line-height:1.1;">'
+        f'      Cast-a-shadow <span style="font-weight:400;font-size:1rem;'
+        f'      color:var(--muted);letter-spacing:0.04em;">beta</span></p>'
+        f'    <p style="font-size:0.78rem;color:var(--muted);margin:0.2rem 0 0;">'
+        f'      Automated perspective-shadow compositing for product images</p>'
+        f'  </div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
@@ -818,7 +1049,11 @@ def main() -> None:
     col_prod, col_shad = st.columns(2, gap="medium")
 
     with col_prod:
-        st.markdown('<div class="section-label">Product Image</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-label" style="min-height:1.6rem;display:flex;align-items:center;">'
+            'Product Image</div>',
+            unsafe_allow_html=True,
+        )
         product_file = st.file_uploader(
             "product",
             type=["png", "jpg", "jpeg"],
@@ -828,9 +1063,8 @@ def main() -> None:
 
     with col_shad:
         st.markdown(
-            '<div class="section-label">'
-            'Shadow Image <span class="chip">optional</span>'
-            '</div>',
+            '<div class="section-label" style="min-height:1.6rem;display:flex;align-items:center;gap:0.4rem;">'
+            'Shadow Image <span class="chip">optional</span></div>',
             unsafe_allow_html=True,
         )
         shadow_file = st.file_uploader(
@@ -855,13 +1089,19 @@ def main() -> None:
 
     # ── Early exits ────────────────────────────────────────────────────────
     if product_file is None:
-        st.info("Upload a product image above to get started.")
+        st.markdown(
+            '<p style="color:var(--muted);font-size:0.9rem;margin-top:0.5rem;">'
+            'Upload a product image above to get started.</p>',
+            unsafe_allow_html=True,
+        )
         return
 
     if shadow_img is None:
-        st.warning(
-            f"No shadow image uploaded and `{DEFAULT_SHADOW_FILE}` was not found "
-            "in the app directory. Please upload a shadow PNG or add a default file."
+        st.markdown(
+            f'<p style="color:var(--muted);font-size:0.9rem;margin-top:0.5rem;">'
+            f'No shadow image uploaded and <code>{DEFAULT_SHADOW_FILE}</code> was not '
+            f'found in the app directory. Please upload a shadow PNG or add a default file.</p>',
+            unsafe_allow_html=True,
         )
         return
 
@@ -937,8 +1177,6 @@ def main() -> None:
         find_bottom_left_anchor(_prod),
         find_bottom_right_anchor(_shad_scaled),
     )
-
-    st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Download ───────────────────────────────────────────────────────────
     st.download_button(
