@@ -552,7 +552,7 @@ def render_sidebar() -> tuple:
 
         st.markdown('<div class="section-label">Shadow Scale</div>', unsafe_allow_html=True)
         shadow_scale = st.slider(
-            "Shadow Scale", 0.10, 1.5, 0.50, 0.025,
+            "Shadow Scale", 0.10, 1.5, 0.75, 0.025,
             label_visibility="collapsed",
             help="Shadow width as multiple of product bbox width",
         )
