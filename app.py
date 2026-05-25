@@ -87,7 +87,7 @@ section[data-testid="stSidebar"] hr { margin:0.3rem 0 !important; }
 [data-testid="stHorizontalBlock"] { align-items:flex-start !important; }
 /* ── Reusable components ──────────────────────────────────── */
 .section-label { font-size:0.70rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); margin-bottom:0.35rem; }
-section[data-testid="stSidebar"] .section-label { margin-bottom:0.55rem; }
+section[data-testid="stSidebar"] .section-label { margin-top:0.45rem; margin-bottom:0.85rem; }
 .result-card { background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:0.9rem 1.5rem; margin-top:2rem; margin-bottom:1.25rem; }
 .header-bar { display:flex; align-items:center; gap:0.8rem; margin-bottom:1.4rem; }
 .chip { display:inline-block; background:var(--chip-bg); border:1px solid var(--border); border-radius:20px; padding:0.15rem 0.6rem; font-size:0.74rem; font-weight:500; color:var(--text); }
@@ -98,6 +98,21 @@ section[data-testid="stSidebar"] .section-label { margin-bottom:0.55rem; }
 /* ── st.code (anchor debug) ───────────────────────────────── */
 [data-testid="stCode"] { background-color:var(--bg-card) !important; border:1px solid var(--border) !important; border-radius:6px !important; }
 [data-testid="stCode"] code { color:var(--text) !important; background:transparent !important; }
+/* ── Color picker: stretch swatch to fill its column ───── */
+[data-testid="stColorPicker"] { width:100% !important; }
+[data-testid="stColorPicker"] > div { width:100% !important; }
+[data-testid="stColorPicker"] [role="button"] {
+  width:100% !important;
+  height:38px !important;
+  border-radius:6px !important;
+  border:1px solid var(--border) !important;
+  box-sizing:border-box !important;
+}
+[data-testid="stColorPicker"] [role="button"] > div {
+  width:100% !important;
+  height:100% !important;
+  border-radius:5px !important;
+}
 /* ── Alert / notification boxes ───────────────────────────── */
 [data-testid="stAlert"],
 [data-baseweb="notification"] {
@@ -127,6 +142,35 @@ section[data-testid="stSidebar"] small,
 section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color:var(--muted) !important; }
 /* ── Chrome ───────────────────────────────────────────────── */
 #MainMenu, footer, header { visibility:hidden; }
+/* ── Don't fade the page during widget-triggered reruns ─────── */
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+  opacity:1 !important;
+  transition:opacity 0s !important;
+}
+/* Streamlit tags elements being recomputed with data-stale="true" and
+   fades them; suppress that so micro-adjustments feel instant. */
+[data-stale], [data-stale="true"],
+[data-stale] *, [data-stale="true"] * {
+  opacity:1 !important;
+  transition:none !important;
+}
+/* BaseWeb inputs animate opacity on rapid value changes (+/- spam). Kill
+   all transitions/animations inside debug-panel widgets so values update
+   instantly without flicker. */
+[data-testid="stNumberInput"] *,
+[data-testid="stNumberInput"] *::before,
+[data-testid="stNumberInput"] *::after,
+[data-testid="stSelectbox"] *,
+[data-testid="stColorPicker"] *,
+[data-testid="stCheckbox"] * {
+  transition:none !important;
+  animation:none !important;
+}
+[data-testid="stNumberInput"] input,
+[data-testid="stNumberInput"] button,
+[data-testid="stNumberInput"] [data-baseweb] {
+  opacity:1 !important;
+}
 </style>""", unsafe_allow_html=True)
 
 
@@ -497,7 +541,16 @@ def render_sidebar() -> tuple:
                 unsafe_allow_html=True,
             )
 
-        st.markdown('<div class="section-label" style="padding-top:1.1rem;">Shadow Scale</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div style="padding-top:0.8rem;margin-bottom:0.6rem;">'
+            '<div class="section-label" style="margin:0 0 0.25rem;">Global defaults</div>'
+            '<p style="font-size:0.72rem;margin:0;line-height:1.4;">'
+            'These apply to every image. Use the debug panel under each result to override per image.'
+            '</p></div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div class="section-label">Shadow Scale</div>', unsafe_allow_html=True)
         shadow_scale = st.slider(
             "Shadow Scale", 0.10, 1.5, 0.50, 0.025,
             label_visibility="collapsed",
@@ -508,7 +561,7 @@ def render_sidebar() -> tuple:
         st.markdown("---")
         st.markdown('<div class="section-label">BG Removal Tolerance</div>', unsafe_allow_html=True)
         bg_tolerance = st.slider(
-            "BG Removal Tolerance", 5, 80, 30, 1,
+            "BG Removal Tolerance", 5, 80, 50, 1,
             label_visibility="collapsed",
             help="Max color distance from detected background",
         )
@@ -528,14 +581,7 @@ def render_sidebar() -> tuple:
         )
         st.caption(f"Margin: {out_margin} px")
 
-        st.markdown("---")
-        st.markdown(
-            '<p style="font-size:0.68rem;">'
-            'Place <code>default_shadow.png</code> in the working directory to auto-load it as the default shadow.'
-            '</p>',
-            unsafe_allow_html=True,
-        )
-
+        
     return shadow_scale, bg_tolerance, add_bg, bg_color_val, out_margin
 
 
@@ -559,28 +605,23 @@ def render_header() -> None:
 
     with st.expander("How it works"):
         st.markdown("""
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem 2rem;padding:0.25rem 0;">
-
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem 2rem;padding:0.25rem 0 1.1rem;">
 <div>
 <div class="section-label">1 · Background removal</div>
 <p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">Corner pixels are sampled to detect the background colour. A BFS flood-fill from all four edges builds a mask, and a Gaussian-smoothed trimap blend removes the background while preserving semi-transparent edges.</p>
 </div>
-
 <div>
 <div class="section-label">2 · Floor contact anchor</div>
 <p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">A sweep line at 30° from vertical scans all solid product pixels. The pixel with the lowest projection value — furthest left <em>and</em> down — is chosen as the floor contact point. This reliably finds the bottom-left corner regardless of product shape.</p>
 </div>
-
 <div>
 <div class="section-label">3 · Shadow anchor</div>
 <p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The same ray-sweep logic at 10° from vertical finds the shadow's bottom-right floor contact point — the pixel furthest right and down. Both angles are tunable constants in the code.</p>
 </div>
-
 <div>
 <div class="section-label">4 · Compositing</div>
 <p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The two anchors are aligned on a shared canvas — the shadow behind, the product on top. Shadow width scales as a multiple of the product bounding-box width. Each result has its own X/Y micro-adjustment in the debug panel for fine-tuning.</p>
 </div>
-
 </div>
 """, unsafe_allow_html=True)
 
@@ -602,7 +643,7 @@ def create_zip(items: list[tuple[str, Image.Image]]) -> bytes:
 
 
 # ── Image display helper ───────────────────────────────────────────────────────
-def _show_image(img: Image.Image, max_h: int = 600) -> None:
+def _show_image(img: Image.Image, max_h: int = 550) -> None:
     buf = io.BytesIO()
     img.save(buf, "PNG")
     b64 = base64.b64encode(buf.getvalue()).decode()
@@ -614,80 +655,147 @@ def _show_image(img: Image.Image, max_h: int = 600) -> None:
     )
 
 
+_PARAM_KEY_PREFIXES = ("scale_", "tol_", "x_", "y_", "m_", "bg_mode_", "bg_")
+
+
+def _read_applied(key: str, global_params: dict) -> dict:
+    """The committed state for this image — global defaults overlaid with overrides."""
+    overrides = st.session_state.setdefault("overrides", {})
+    return {**global_params, **overrides.get(key, {})}
+
+
+def _read_pending(key: str, applied: dict) -> dict:
+    """Current widget state. Initialised from `applied` on first render of each widget."""
+    a = applied
+    mode_default = "Opaque" if a["bg_color"] is not None else "Transparent"
+    bg_mode = st.session_state.get(f"bg_mode_{key}", mode_default)
+    bg_color = st.session_state.get(f"bg_{key}", a["bg_color"] or "#EAE8E0")
+    return {
+        "shadow_scale": float(st.session_state.get(f"scale_{key}", a["shadow_scale"])),
+        "tolerance":    int(st.session_state.get(f"tol_{key}",   a["tolerance"])),
+        "offset_x":     int(st.session_state.get(f"x_{key}",     a["offset_x"])),
+        "offset_y":     int(st.session_state.get(f"y_{key}",     a["offset_y"])),
+        "margin":       int(st.session_state.get(f"m_{key}",     a["margin"])),
+        "bg_color":     bg_color if bg_mode == "Opaque" else None,
+    }
+
+
+def _reset_widgets(key: str) -> None:
+    """Forget all widget state for this image so next render re-reads from applied."""
+    for prefix in _PARAM_KEY_PREFIXES:
+        st.session_state.pop(f"{prefix}{key}", None)
+
+
 # ── Per-image result renderer ──────────────────────────────────────────────────
 def _render_result(
     key: str,
     stem: str,
-    prod: Image.Image,
-    shad: Image.Image,
-    prod_anchor: tuple,
-    shad_anchor: tuple,
-    bg_color: str | None,
-    margin: int,
+    applied: dict,
+    layers: tuple,
+    global_params: dict,
     dl_key_suffix: str,
 ) -> Image.Image:
-    """Render one composited result with its own micro-adjustment controls.
-    Reads `(applied_x, applied_y)` from session state and applies them to the cached
-    layers. Number inputs adjust pending values; only the Apply button commits."""
-    offsets = st.session_state.setdefault("offsets", {})
-    applied_x, applied_y = offsets.get(key, (0, 0))
+    """Render one composited result.
+    `applied` is the committed state for this image (what the main image shows).
+    Widget state is collected as `pending`; only Apply commits pending → overrides."""
+    prod, shad, prod_anchor, shad_anchor = layers
 
     output_img = assemble_composite(
         prod, shad, prod_anchor, shad_anchor,
-        applied_x, applied_y, bg_color, margin,
+        applied["offset_x"], applied["offset_y"],
+        applied["bg_color"], applied["margin"],
     )
     _show_image(output_img)
 
     with st.expander("Anchor debug & micro-adjustment — click to fine-tune"):
-        # ── Adjustment controls ────────────────────────────────────────────────
-        st.markdown('<div class="section-label">Micro-adjustment (per image)</div>', unsafe_allow_html=True)
-        adj_cols = st.columns([1, 1, 1, 1])
-        with adj_cols[0]:
-            pending_x = st.number_input(
-                "X offset (px)", value=applied_x, step=1,
-                key=f"x_{key}", help="Nudge shadow horizontally",
+        overrides = st.session_state.setdefault("overrides", {})
+        applied_diffs = sorted(overrides.get(key, {}).keys())
+        if applied_diffs:
+            st.markdown(
+                '<p style="font-size:0.78rem;color:var(--muted);margin:0 0 0.7rem;">'
+                f'Per-image overrides active for: <code>{", ".join(applied_diffs)}</code>. '
+                f'<strong>Reset</strong> reverts to global defaults.</p>',
+                unsafe_allow_html=True,
             )
-        with adj_cols[1]:
-            pending_y = st.number_input(
-                "Y offset (px)", value=applied_y, step=1,
-                key=f"y_{key}", help="Nudge shadow vertically",
+
+        # ── Row 1: Shadow Scale · BG Tolerance · X offset · Y offset ──────────
+        row1 = st.columns(4)
+        with row1[0]:
+            st.number_input(
+                "Shadow Scale", min_value=0.10, max_value=1.5,
+                value=float(applied["shadow_scale"]), step=0.025,
+                key=f"scale_{key}", format="%.3f",
             )
-        pending = (int(pending_x), int(pending_y))
-        is_pending = pending != (applied_x, applied_y)
-        with adj_cols[2]:
-            st.markdown('<div style="height:1.65rem;"></div>', unsafe_allow_html=True)
+        with row1[1]:
+            st.number_input(
+                "BG Tolerance", min_value=5, max_value=80,
+                value=int(applied["tolerance"]), step=1,
+                key=f"tol_{key}",
+            )
+        with row1[2]:
+            st.number_input(
+                "X offset (px)", value=int(applied["offset_x"]),
+                step=1, key=f"x_{key}",
+            )
+        with row1[3]:
+            st.number_input(
+                "Y offset (px)", value=int(applied["offset_y"]),
+                step=1, key=f"y_{key}",
+            )
+
+        # ── Row 2: Margin · Background mode · Color picker · empty ────────────
+        row2 = st.columns(4)
+        with row2[0]:
+            st.number_input(
+                "Margin (px)", min_value=0, max_value=300,
+                value=int(applied["margin"]), step=5, key=f"m_{key}",
+            )
+        with row2[1]:
+            bg_mode = st.selectbox(
+                "Background",
+                ["Transparent", "Opaque"],
+                index=1 if applied["bg_color"] is not None else 0,
+                key=f"bg_mode_{key}",
+            )
+        with row2[2]:
+            if bg_mode == "Opaque":
+                st.color_picker(
+                    "Colour",
+                    value=applied["bg_color"] or "#EAE8E0",
+                    key=f"bg_{key}",
+                )
+
+        # ── Apply / Reset buttons ──────────────────────────────────────────────
+        pending = _read_pending(key, applied)
+        is_pending = pending != applied
+        has_override = key in overrides
+
+        st.markdown('<div style="margin-top:0.7rem;"></div>', unsafe_allow_html=True)
+        btn_cols = st.columns([1, 1, 5])
+        with btn_cols[0]:
             if st.button(
                 "Apply", key=f"apply_{key}",
                 use_container_width=True, disabled=not is_pending,
                 type="primary" if is_pending else "secondary",
             ):
-                offsets[key] = pending
+                diffs = {k: v for k, v in pending.items() if v != global_params[k]}
+                if diffs:
+                    overrides[key] = diffs
+                else:
+                    overrides.pop(key, None)
                 st.rerun()
-        with adj_cols[3]:
-            st.markdown('<div style="height:1.65rem;"></div>', unsafe_allow_html=True)
+        with btn_cols[1]:
             if st.button(
                 "Reset", key=f"reset_{key}",
-                use_container_width=True, disabled=(applied_x == 0 and applied_y == 0),
+                use_container_width=True, disabled=not has_override,
             ):
-                offsets[key] = (0, 0)
+                overrides.pop(key, None)
+                _reset_widgets(key)
                 st.rerun()
-
-        # ── Live preview of pending change ────────────────────────────────────
-        if is_pending:
-            st.markdown(
-                '<div class="section-label" style="margin-top:0.6rem;">'
-                'Preview (click Apply to commit)</div>',
-                unsafe_allow_html=True,
-            )
-            preview_img = assemble_composite(
-                prod, shad, prod_anchor, shad_anchor,
-                pending[0], pending[1], bg_color, margin,
-            )
-            _show_image(preview_img, max_h=380)
 
         # ── Anchor crosshairs ─────────────────────────────────────────────────
         st.markdown(
-            '<div class="section-label" style="margin-top:0.8rem;">Anchor placement</div>',
+            '<div class="section-label" style="margin-top:0.9rem;">Anchor placement</div>',
             unsafe_allow_html=True,
         )
         dcol1, dcol2 = st.columns(2)
@@ -781,47 +889,60 @@ def main() -> None:
         options_parts.append(f"margin {out_margin}px")
     options_str = " · ".join(options_parts) if options_parts else "default settings"
 
-    bg_color = bg_color_val if add_bg else None
+    global_params: dict = {
+        "shadow_scale": float(shadow_scale),
+        "tolerance": int(bg_tolerance),
+        "offset_x": 0,
+        "offset_y": 0,
+        "bg_color": bg_color_val if add_bg else None,
+        "margin": int(out_margin),
+    }
 
-    # ── Run heavy stage for each file (cached) ─────────────────────────────────
-    spinner_slot = st.empty()
-    prepared: list[tuple] = []  # [(file, key, layers_or_None, err)]
     n = len(product_files)
 
-    for i, f in enumerate(product_files):
-        spinner_slot.markdown(
-            f'<div class="cas-status"><span class="cas-ring"></span>'
-            f'Preparing {i + 1} / {n} — {f.name}</div>',
-            unsafe_allow_html=True,
-        )
-        key = getattr(f, "file_id", None) or f.name
-        try:
-            product_bytes = f.getvalue()
-            layers = _prepare_layers_cached(product_bytes, shadow_bytes, shadow_scale, bg_tolerance)
-            prepared.append((f, key, layers, ""))
-        except Exception as exc:
-            prepared.append((f, key, None, str(exc)))
+    # ── Prepare layers for each file (spinner only when fresh prep is needed) ─
+    # We track which (file, scale, tolerance, shadow) combos have already been
+    # prepared so idle widget-driven reruns don't flash the progress text.
+    prepped_combos: set = st.session_state.setdefault("_prepped_combos", set())
+    shadow_id = hash(shadow_bytes)
 
+    spinner_slot = st.empty()
+    prepared: list[tuple] = []  # [(file, key, applied, layers_or_None, err)]
+    for i, f in enumerate(product_files):
+        key = getattr(f, "file_id", None) or f.name
+        applied = _read_applied(key, global_params)
+        combo = (key, applied["shadow_scale"], applied["tolerance"], shadow_id)
+        if combo not in prepped_combos:
+            spinner_slot.markdown(
+                f'<div class="cas-status"><span class="cas-ring"></span>'
+                f'Compositing {i + 1} / {n} — {f.name}</div>',
+                unsafe_allow_html=True,
+            )
+        try:
+            layers = _prepare_layers_cached(
+                f.getvalue(), shadow_bytes,
+                applied["shadow_scale"], applied["tolerance"],
+            )
+            prepped_combos.add(combo)
+            prepared.append((f, key, applied, layers, None))
+        except Exception as exc:
+            prepared.append((f, key, applied, None, str(exc)))
     spinner_slot.empty()
 
     # ── Render results ─────────────────────────────────────────────────────────
     if n == 1:
+        f, key, applied, layers, err = prepared[0]
+        stem = os.path.splitext(f.name)[0]
         st.markdown(
             f'<div class="result-card">'
             f'<div class="section-label">Result — {shadow_label} · {options_str}</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
-        f, key, layers, err = prepared[0]
         if layers is None:
             st.error(f"Compositing failed: {err}")
             return
-        prod, shad, prod_anchor, shad_anchor = layers
-        stem = os.path.splitext(f.name)[0]
-        _render_result(
-            key, stem, prod, shad, prod_anchor, shad_anchor,
-            bg_color, out_margin, dl_key_suffix="single",
-        )
+        _render_result(key, stem, applied, layers, global_params, dl_key_suffix="single")
     else:
         st.markdown(
             f'<div class="result-card">'
@@ -830,7 +951,7 @@ def main() -> None:
             unsafe_allow_html=True,
         )
         outputs: list[tuple[str, Image.Image]] = []
-        for i, (f, key, layers, err) in enumerate(prepared):
+        for i, (f, key, applied, layers, err) in enumerate(prepared):
             stem = os.path.splitext(f.name)[0]
             st.markdown(
                 f'<div class="section-label" style="margin-top:1rem;">{stem}</div>',
@@ -839,10 +960,8 @@ def main() -> None:
             if layers is None:
                 st.error(f"Failed: {err}")
                 continue
-            prod, shad, prod_anchor, shad_anchor = layers
             out_img = _render_result(
-                key, stem, prod, shad, prod_anchor, shad_anchor,
-                bg_color, out_margin, dl_key_suffix=f"batch_{i}",
+                key, stem, applied, layers, global_params, dl_key_suffix=f"batch_{i}",
             )
             outputs.append((f"{stem}_shadow.png", out_img))
 
