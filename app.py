@@ -1,6 +1,6 @@
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageFilter, ImageDraw, ImageColor
+from PIL import Image, ImageFilter, ImageDraw, ImageColor, ImageOps
 import io
 import base64
 import os
@@ -384,6 +384,43 @@ def find_bottom_right_anchor(img: Image.Image) -> tuple:
     return (int(xs[idx]), int(ys[idx]))
 
 
+def find_bottom_right_product_anchor(img: Image.Image) -> tuple:
+    """Mirror of find_bottom_left_anchor — for products whose shadow falls right.
+    proj = x * sin(theta) + y * cos(theta), argmax → bottom-right floor contact.
+    """
+    arr = np.array(img.convert("RGBA"))
+    h, w = arr.shape[:2]
+    alpha, rgb = arr[:, :, 3], arr[:, :, :3]
+
+    valid = (alpha > 100) & ~np.all(rgb > 235, axis=2)
+    if not np.any(valid):
+        return (w - 1, h - 1)
+
+    theta = np.radians(ANCHOR_RAY_ANGLE)
+    ys, xs = np.where(valid)
+    proj = xs.astype(np.float64) * np.sin(theta) + ys.astype(np.float64) * np.cos(theta)
+    idx = int(np.argmax(proj))
+    return (int(xs[idx]), int(ys[idx]))
+
+
+def find_bottom_left_shadow_anchor(img: Image.Image) -> tuple:
+    """Mirror of find_bottom_right_anchor — for the horizontally-mirrored shadow.
+    proj = x * sin(theta) - y * cos(theta), argmin → bottom-left floor contact.
+    """
+    arr = np.array(img.convert("RGBA"))
+    h, _w = arr.shape[:2]
+
+    valid = arr[:, :, 3] >= 25
+    if not np.any(valid):
+        return (0, h - 1)
+
+    theta = np.radians(SHADOW_RAY_ANGLE)
+    ys, xs = np.where(valid)
+    proj = xs.astype(np.float64) * np.sin(theta) - ys.astype(np.float64) * np.cos(theta)
+    idx = int(np.argmin(proj))
+    return (int(xs[idx]), int(ys[idx]))
+
+
 # ── Debug helpers ──────────────────────────────────────────────────────────────
 def draw_crosshair(img: Image.Image, anchor: tuple, color: tuple = (255, 40, 40)) -> Image.Image:
     img = img.copy().convert("RGBA")
@@ -416,9 +453,14 @@ def prepare_layers(
     shadow_img: Image.Image,
     shadow_scale: float,
     tolerance: int,
+    shadow_side: str = "left",
 ) -> tuple:
     """Heavy stage: background removal, baked-shadow strip, anchor detection.
     Output feeds assemble_composite, which is cheap and re-runnable for offset tuning.
+
+    shadow_side: "left" (default) or "right". When "right", the shadow image is
+    mirrored horizontally and the product/shadow anchors are flipped so the
+    shadow falls on the right side of the product.
 
     Returns: (prod, shad, prod_anchor, shad_anchor)
     """
@@ -439,8 +481,13 @@ def prepare_layers(
 
     shad_bbox = shad.getbbox()
     if shad_bbox is None:
+        if shadow_side == "right":
+            return prod, shad, (prod.width - 1, prod.height - 1), (0, shadow_img.height - 1)
         return prod, shad, (0, prod.height - 1), (shadow_img.width - 1, shadow_img.height - 1)
     shad = shad.crop(shad_bbox)
+
+    if shadow_side == "right":
+        shad = ImageOps.mirror(shad)
 
     pw, _ = prod.size
     sw, sh = shad.size
@@ -448,8 +495,12 @@ def prepare_layers(
     target_h = max(1, int(target_w * sh / max(sw, 1)))
     shad = shad.resize((target_w, target_h), Image.LANCZOS)
 
-    prod_anchor = find_bottom_left_anchor(prod)
-    shad_anchor = find_bottom_right_anchor(shad)
+    if shadow_side == "right":
+        prod_anchor = find_bottom_right_product_anchor(prod)
+        shad_anchor = find_bottom_left_shadow_anchor(shad)
+    else:
+        prod_anchor = find_bottom_left_anchor(prod)
+        shad_anchor = find_bottom_right_anchor(shad)
     return prod, shad, prod_anchor, shad_anchor
 
 
@@ -521,12 +572,13 @@ def _prepare_layers_cached(
     shadow_bytes: bytes,
     shadow_scale: float,
     tolerance: int,
+    shadow_side: str,
 ) -> tuple:
-    """Cached entry point — keyed by file bytes + scale + tolerance.
+    """Cached entry point — keyed by file bytes + scale + tolerance + side.
     Survives reruns; invalidated only when one of the inputs actually changes."""
     prod_img = Image.open(io.BytesIO(product_bytes))
     shad_img = Image.open(io.BytesIO(shadow_bytes))
-    return prepare_layers(prod_img, shad_img, shadow_scale, tolerance)
+    return prepare_layers(prod_img, shad_img, shadow_scale, tolerance, shadow_side)
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -559,6 +611,19 @@ def render_sidebar() -> tuple:
         st.caption(f"Shadow Scale: {shadow_scale:.3f}")
 
         st.markdown("---")
+        st.markdown('<div class="section-label">Shadow Side</div>', unsafe_allow_html=True)
+        shadow_side_label = st.radio(
+            "Shadow Side",
+            options=["Left", "Right"],
+            index=0,
+            horizontal=True,
+            label_visibility="collapsed",
+            help="Which side of the product the shadow falls on",
+        )
+        shadow_side = shadow_side_label.lower()
+        st.caption(f"Shadow falls to the {shadow_side}")
+
+        st.markdown("---")
         st.markdown('<div class="section-label">BG Removal Tolerance</div>', unsafe_allow_html=True)
         bg_tolerance = st.slider(
             "BG Removal Tolerance", 5, 80, 50, 1,
@@ -582,7 +647,7 @@ def render_sidebar() -> tuple:
         st.caption(f"Margin: {out_margin} px")
 
         
-    return shadow_scale, bg_tolerance, add_bg, bg_color_val, out_margin
+    return shadow_scale, shadow_side, bg_tolerance, add_bg, bg_color_val, out_margin
 
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -677,6 +742,7 @@ def _read_pending(key: str, applied: dict) -> dict:
         "offset_y":     int(st.session_state.get(f"y_{key}",     a["offset_y"])),
         "margin":       int(st.session_state.get(f"m_{key}",     a["margin"])),
         "bg_color":     bg_color if bg_mode == "Opaque" else None,
+        "shadow_side":  a["shadow_side"],  # global only — no per-image widget
     }
 
 
@@ -827,7 +893,7 @@ def _render_result(
 def main() -> None:
     inject_css()
 
-    shadow_scale, bg_tolerance, add_bg, bg_color_val, out_margin = render_sidebar()
+    shadow_scale, shadow_side, bg_tolerance, add_bg, bg_color_val, out_margin = render_sidebar()
     render_header()
 
     upload_row, _ = st.columns([3, 1])
@@ -896,6 +962,7 @@ def main() -> None:
         "offset_y": 0,
         "bg_color": bg_color_val if add_bg else None,
         "margin": int(out_margin),
+        "shadow_side": shadow_side,
     }
 
     n = len(product_files)
@@ -911,7 +978,8 @@ def main() -> None:
     for i, f in enumerate(product_files):
         key = getattr(f, "file_id", None) or f.name
         applied = _read_applied(key, global_params)
-        combo = (key, applied["shadow_scale"], applied["tolerance"], shadow_id)
+        combo = (key, applied["shadow_scale"], applied["tolerance"],
+                 shadow_id, applied["shadow_side"])
         if combo not in prepped_combos:
             spinner_slot.markdown(
                 f'<div class="cas-status"><span class="cas-ring"></span>'
@@ -922,6 +990,7 @@ def main() -> None:
             layers = _prepare_layers_cached(
                 f.getvalue(), shadow_bytes,
                 applied["shadow_scale"], applied["tolerance"],
+                applied["shadow_side"],
             )
             prepped_combos.add(combo)
             prepared.append((f, key, applied, layers, None))
