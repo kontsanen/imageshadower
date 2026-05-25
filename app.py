@@ -1,1191 +1,862 @@
-"""
-Harvia Labs — Image Shadow Compositor
-======================================
-Automated perspective-shadow compositing for e-commerce product images.
-
-Core algorithm:
-  1. Crop both images to their tight bounding boxes.
-  2. Scale the shadow to match the desired fraction of the product width.
-  3. Locate the product's bottom-left anchor and the shadow's bottom-right anchor
-     using visual corner detection (ignores transparent / white / black pixels).
-  4. Align anchor points and paste shadow behind product on a dynamic canvas.
-  5. Trim transparent margins and return the final composite.
-"""
-
-import base64
-import io
-import os
-from typing import Optional, Tuple
-
-import numpy as np
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFilter
+import numpy as np
+from PIL import Image, ImageFilter, ImageDraw, ImageColor
+import io
+import base64
+import os
+from collections import deque
+import zipfile
 
-# ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
+# ── Anchor ray angles ─────────────────────────────────────────────────────────
+# Degrees from vertical for the sweep lines used to locate floor-contact corners.
+# Increase -> weights downward position more; decrease -> weights left/right more.
+ANCHOR_RAY_ANGLE: float = 30.0   # product bottom-left  sweep — tune here
+SHADOW_RAY_ANGLE: float = 10.0   # shadow  bottom-right sweep — tune here
+
+# ── Page config (must be first Streamlit call) ─────────────────────────────────
 st.set_page_config(
-    page_title="Cast-a-shadow beta — Harvia Labs",
+    page_title="Cast-a-shadow beta - Harvia Labs",
     page_icon="🌤️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ─── DESIGN TOKENS & GLOBAL CSS ───────────────────────────────────────────────
-# Matches the Harvia Labs design mockup: beige background, red accent, Gotham/
-# Chevin Pro font stack. Both fonts are commercial; a Google-hosted humanist
-# sans (Barlow) is listed as the open-source fallback so the layout still looks
-# clean on machines without the licensed fonts installed.
-STYLE = """
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&display=swap');
-
-  /* Let the browser pick up locally-installed Gotham / Chevin Pro first */
-  @font-face { font-family:'Chevin Pro'; src:local('Chevin Pro'),local('ChevinPro'); }
-  @font-face { font-family:'Gotham';     src:local('Gotham'),local('GothamBook');    }
-
-  html, body, [class*="css"] {
-    font-family: 'Chevin Pro','Gotham','Barlow',sans-serif !important;
-  }
-
-  :root {
-    --bg:           #F0EDE6;
-    --bg-sidebar:   #E4E0D8;
-    --bg-card:      #FAF9F6;
-    --red:          #CC0000;
-    --red-h:        #AA0000;
-    --text:         #1A1A1A;
-    --muted:        #6B6560;
-    --border:       #D4CFC7;
-    --chip-bg:      #EDEBE5;
-  }
-
-  .stApp                                  { background-color: var(--bg); }
-  section[data-testid="stSidebar"]        { background-color: var(--bg-sidebar);
-                                            border-right: 1px solid var(--border); }
-
-  /* Slider: thumb knob + filled track red; suppress all hover/focus backgrounds */
-  .stSlider [role="slider"]                      { background-color: var(--red) !important;
-                                                   border-color:     var(--red) !important; }
-  .stSlider > div > div > div > div              { background-color: var(--red) !important; }
-  /* The last-child of [data-baseweb="slider"] is the tick/label bar — keep it transparent
-     so it never shows as an ugly red box on hover */
-  .stSlider [data-baseweb="slider"] > div:last-child { background-color: transparent !important; }
-  /* Kill focus outlines and hover rings */
-  .stSlider [role="slider"]:focus,
-  .stSlider [role="slider"]:focus-visible        { outline: none !important;
-                                                   box-shadow: none !important; }
-  .stSlider > div:focus-within,
-  .stSlider [data-baseweb="slider"]:focus-within { background-color: transparent !important;
-                                                   outline: none !important; }
-
-  /* Buttons & download */
-  .stButton > button,
-  .stDownloadButton > button {
-    background-color: var(--red)   !important;
-    color:            white         !important;
-    border:           none          !important;
-    border-radius:    6px           !important;
-    font-family:      'Chevin Pro','Gotham','Barlow',sans-serif !important;
-    font-weight:      600           !important;
-    letter-spacing:   0.03em;
-    padding:          0.45rem 1.2rem !important;
-    transition:       background-color 0.15s;
-  }
-  .stButton > button:hover,
-  .stDownloadButton > button:hover { background-color: var(--red-h) !important; }
-
-  /* File uploader: full-zone clickable drop area (no prominent button) */
-  [data-testid="stFileUploaderDropzone"] {
-    position:         relative !important;
-    background-color: var(--bg-card) !important;
-    border:           1.5px dashed var(--border) !important;
-    border-radius:    10px !important;
-    min-height:       110px !important;
-    display:          flex !important;
-    align-items:      center !important;
-    justify-content:  center !important;
-    cursor:           pointer !important;
-    transition:       border-color 0.15s, background-color 0.15s !important;
-  }
-  [data-testid="stFileUploaderDropzone"]:hover {
-    border-color:     var(--red) !important;
-    background-color: rgba(204, 0, 0, 0.03) !important;
-  }
-  /* Stretch the Browse-files button to fill the whole zone so anywhere is clickable.
-     Background matches the dropzone so it covers the default Streamlit instructions text. */
-  [data-testid="stFileUploaderDropzone"] button {
-    position:         absolute !important;
-    inset:            0 !important;
-    z-index:          1 !important;
-    width:            100% !important;
-    height:           100% !important;
-    margin:           0 !important;
-    padding:          0 !important;
-    background:       var(--bg-card) !important;
-    border:           none !important;
-    border-radius:    10px !important;
-    box-shadow:       none !important;
-    color:            var(--muted) !important;
-    font-size:        0.82rem !important;
-    font-weight:      500 !important;
-    letter-spacing:   0.05em !important;
-    text-transform:   uppercase !important;
-    cursor:           pointer !important;
-    display:          flex !important;
-    align-items:      center !important;
-    justify-content:  center !important;
-    gap:              0.45rem !important;
-    transition:       color 0.15s, background-color 0.15s !important;
-  }
-  [data-testid="stFileUploaderDropzone"]:hover button {
-    background:       rgba(204, 0, 0, 0.03) !important;
-    color:            var(--red) !important;
-  }
-  /* File size limit text: pin to bottom-center of the drop zone.
-     Target both <small> and any <span> Streamlit may use for this text. */
-  [data-testid="stFileUploaderDropzone"] small,
-  [data-testid="stFileUploaderDropzone"] [data-testid="stFileUploadDropInstructions"] small,
-  [data-testid="stFileUploaderDropzone"] > div > small,
-  [data-testid="stFileUploaderDropzone"] > div > div > small {
-    position:       absolute !important;
-    bottom:         0.6rem !important;
-    left:           0 !important;
-    right:          0 !important;
-    display:        block !important;
-    text-align:     center !important;
-    color:          var(--muted) !important;
-    font-size:      0.70rem !important;
-    letter-spacing: 0.02em !important;
-    pointer-events: none !important;
-    z-index:        3 !important;
-  }
-
-  /* Lock sidebar open — override the CSS transform Streamlit uses to slide it off-screen */
-  section[data-testid="stSidebar"] {
-    transform:  translateX(0) !important;
-    display:    flex !important;
-    visibility: visible !important;
-    min-width:  280px !important;
-    width:      280px !important;
-  }
-
-  /* Hide the sidebar CLOSE button (the × inside the open sidebar) */
-  [data-testid="stSidebarCollapseButton"] { display: none !important; }
-
-  /* Expand button — keep visible in case Streamlit still renders it */
-  [data-testid="stSidebarCollapsedControl"],
-  [data-testid="collapsedControl"] {
-    position:         fixed !important;
-    left:             0 !important;
-    top:              50vh !important;
-    transform:        translateY(-50%) !important;
-    z-index:          9999 !important;
-    display:          flex !important;
-    visibility:       visible !important;
-    opacity:          1 !important;
-    width:            1.8rem !important;
-    height:           3rem !important;
-    background-color: var(--red) !important;
-    border-radius:    0 8px 8px 0 !important;
-    align-items:      center !important;
-    justify-content:  center !important;
-    cursor:           pointer !important;
-    box-shadow:       2px 0 6px rgba(0,0,0,0.15) !important;
-  }
-  [data-testid="stSidebarCollapsedControl"] button,
-  [data-testid="collapsedControl"] button {
-    background:      transparent !important;
-    border:          none !important;
-    width:           100% !important;
-    height:          100% !important;
-    display:         flex !important;
-    align-items:     center !important;
-    justify-content: center !important;
-    padding:         0 !important;
-  }
-  [data-testid="stSidebarCollapsedControl"] svg,
-  [data-testid="collapsedControl"] svg {
-    fill:  white !important;
-    color: white !important;
-  }
-
-  /* Reduce main content block padding */
-  .block-container {
-    padding-top:   1rem !important;
-    padding-left:  1.2rem !important;
-    padding-right: 1.2rem !important;
-    max-width:     none  !important;
-  }
-
-  /* Spinner — text dark, ring uses brand muted tone.
-     Streamlit's spinner SVG uses stroke="currentColor", so setting color on the
-     SVG element propagates to the arc via currentColor. */
-  [data-testid="stSpinner"],
-  [data-testid="stSpinner"] > div,
-  [data-testid="stSpinner"] p,
-  [data-testid="stSpinner"] span,
-  .stSpinner, .stSpinner p, .stSpinner span { color: var(--text) !important; }
-  /* The SVG ring: force currentColor to muted so the arc is visible */
-  [data-testid="stSpinner"] svg             { color:  var(--muted) !important; }
-  [data-testid="stSpinner"] svg *           { stroke: var(--muted) !important;
-                                              color:  var(--muted) !important; }
-
-  /* Info / warning / error boxes — replace Streamlit blue with brand palette */
-  [data-testid="stAlert"] {
-    background-color: var(--bg-card)   !important;
-    border:           1px solid var(--border) !important;
-    border-left:      3px solid var(--muted) !important;
-    border-radius:    8px !important;
-    color:            var(--muted) !important;
-  }
-  [data-testid="stAlert"] p { color: var(--muted) !important; }
-  [data-testid="stAlert"] svg { display: none !important; }
-
-  /* Upload columns: align tops */
-  [data-testid="stHorizontalBlock"] { align-items: flex-start !important; }
-
-  /* Sidebar: fix caption/label text colour (appears white by default) */
-  section[data-testid="stSidebar"] p,
-  section[data-testid="stSidebar"] small,
-  section[data-testid="stSidebar"] .stCaption,
-  section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
-    color: var(--muted) !important;
-  }
-
-  /* Sidebar top space: set the content wrapper's padding-top to match the
-     sidebar's natural left padding so the logo has equal breathing room top & left */
-  [data-testid="stSidebarContent"] {
-    padding-top: 1rem !important;
-  }
-
-  /* Sidebar spacing: tighten dividers and caption gaps only; leave slider
-     containers with their natural spacing so nothing overlaps */
-  section[data-testid="stSidebar"] hr {
-    margin: 0.4rem 0 !important;
-  }
-  section[data-testid="stSidebar"] .section-label {
-    margin-bottom: 0.15rem !important;
-  }
-  section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {
-    margin-top: 0 !important;
-  }
-
-  /* Sidebar logo image: no extra Streamlit image padding */
-  section[data-testid="stSidebar"] [data-testid="stImage"] {
-    margin-bottom: 0.15rem !important;
-    margin-top:    0 !important;
-  }
-
-  /* Result card wrapper — label-only box above the output image */
-  .result-card {
-    background:    var(--bg-card);
-    border:        1px solid var(--border);
-    border-radius: 12px;
-    padding:       0.9rem 1.5rem;
-    margin-top:    2rem;
-    margin-bottom: 1.25rem;   /* gap between label card and image below */
-  }
+# ── CSS (only what config.toml cannot do) ──────────────────────────────────────
+def inject_css() -> None:
+    st.markdown("""<style>
+@import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&display=swap');
+@font-face { font-family:'Chevin Pro'; src:local('Chevin Pro'),local('ChevinPro'); }
+@font-face { font-family:'Gotham';     src:local('Gotham'),local('GothamBook'); }
+html, body, [class*="css"] {
+  font-family: 'Chevin Pro','Gotham','Barlow',sans-serif !important;
+}
+:root {
+  --bg:       #EAE8E0;
+  --bg-card:  #F5F4F0;
+  --red:      #ED1C24;
+  --red-h:    #C41520;
+  --text:     #505045;
+  --muted:    #727266;
+  --border:   #D9D6C8;
+  --chip-bg:  #EAE8E0;
+}
+/* ── Sidebar header gap ───────────────────────────────────── */
+[data-testid="stSidebarHeader"] {
+  height:0 !important; min-height:0 !important;
+  padding:0 !important; margin:0 !important; overflow:hidden !important;
+}
+section[data-testid="stSidebar"] > div,
+[data-testid="stSidebarContent"] { padding-top:0 !important; }
+section[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+  margin-top:0 !important; padding-top:0 !important; gap:0.65rem !important;
+}
+section[data-testid="stSidebar"] hr { margin:0.3rem 0 !important; }
+/* ── File uploader ────────────────────────────────────────── */
+[data-testid="stFileUploaderDropzone"] {
+  background:var(--bg-card) !important;
+  border:1.5px dashed var(--border) !important;
+  border-radius:10px !important; min-height:110px !important; padding:1rem !important;
+}
+[data-testid="stFileUploaderDropzone"]:hover { border-color:var(--red) !important; }
+[data-testid="stFileUploaderDropzone"] button {
+  background:transparent !important; border:1px solid var(--border) !important;
+  border-radius:6px !important; box-shadow:none !important;
+  color:var(--muted) !important; font-size:0.80rem !important;
+}
+[data-testid="stFileUploaderDropzone"] button:hover {
+  color:var(--red) !important; border-color:var(--red) !important;
+}
+/* Rename "Upload" → "Upload image" */
+[data-testid="stFileUploaderDropzone"] button p { font-size:0 !important; }
+[data-testid="stFileUploaderDropzone"] button p::after { content:'Upload image'; font-size:13px !important; color:var(--muted) !important; }
+[data-testid="stFileUploaderDropzone"] small { color:var(--muted) !important; font-size:0.68rem !important; }
+[data-testid="stFileUploaderDropzoneDragOver"],
+[data-testid="stFileUploaderDropzone"]:focus-within {
+  background-color:rgba(217,214,200,0.25) !important; border-color:var(--border) !important;
+}
+/* ── Slider: suppress last-child red box on hover ────────── */
+.stSlider [data-baseweb="slider"] > div:last-child { background-color:transparent !important; }
+.stSlider [role="slider"]:focus,
+.stSlider [role="slider"]:focus-visible { outline:none !important; box-shadow:none !important; }
+/* ── Custom spinner ───────────────────────────────────────── */
+@keyframes cas-spin { to { transform:rotate(360deg); } }
+.cas-status { display:flex; align-items:center; gap:0.55rem; color:#505045; font-size:0.90rem; margin:0.6rem 0; }
+.cas-ring { flex-shrink:0; width:16px; height:16px; border:2px solid #D9D6C8; border-top-color:#727266; border-radius:50%; animation:cas-spin 0.75s linear infinite; }
+/* ── Layout ───────────────────────────────────────────────── */
+.block-container { padding-top:1rem !important; padding-left:1.2rem !important; padding-right:1.2rem !important; max-width:none !important; }
+[data-testid="stHorizontalBlock"] { align-items:flex-start !important; }
+/* ── Reusable components ──────────────────────────────────── */
+.section-label { font-size:0.70rem; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; color:var(--muted); margin-bottom:0.35rem; }
+section[data-testid="stSidebar"] .section-label { margin-bottom:0.55rem; }
+.result-card { background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:0.9rem 1.5rem; margin-top:2rem; margin-bottom:1.25rem; }
+.header-bar { display:flex; align-items:center; gap:0.8rem; margin-bottom:1.4rem; }
+.chip { display:inline-block; background:var(--chip-bg); border:1px solid var(--border); border-radius:20px; padding:0.15rem 0.6rem; font-size:0.74rem; font-weight:500; color:var(--text); }
+/* ── Expander ─────────────────────────────────────────────── */
+[data-testid="stExpander"] > details { background-color:var(--bg-card) !important; border:1px solid var(--border) !important; border-radius:8px !important; }
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary p { background-color:var(--bg-card) !important; color:var(--text) !important; }
+/* ── st.code (anchor debug) ───────────────────────────────── */
+[data-testid="stCode"] { background-color:var(--bg-card) !important; border:1px solid var(--border) !important; border-radius:6px !important; }
+[data-testid="stCode"] code { color:var(--text) !important; background:transparent !important; }
+/* ── Alert / notification boxes ───────────────────────────── */
+[data-testid="stAlert"],
+[data-baseweb="notification"] {
+  background-color:var(--bg-card) !important;
+  border:1px solid var(--border) !important;
+  border-left:3px solid var(--muted) !important;
+  border-radius:8px !important;
+}
+[data-testid="stAlert"] p,
+[data-baseweb="notification"] p { color:var(--muted) !important; }
+[data-testid="stAlert"] svg,
+[data-baseweb="notification"] svg { display:none !important; }
+/* ── Download button — Harvia red ─────────────────────────── */
+[data-testid="stDownloadButton"] button {
+  background-color:var(--red) !important;
+  color:#FFFFFF !important;
+  border-color:var(--red) !important;
+}
+[data-testid="stDownloadButton"] button:hover {
+  background-color:var(--red-h) !important;
+  border-color:var(--red-h) !important;
+  color:#FFFFFF !important;
+}
+/* ── Sidebar text ─────────────────────────────────────────── */
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p { color:var(--muted) !important; }
+/* ── Chrome ───────────────────────────────────────────────── */
+#MainMenu, footer, header { visibility:hidden; }
+</style>""", unsafe_allow_html=True)
 
 
-  /* Reusable label style (uppercase track) */
-  .section-label {
-    font-size:      0.70rem;
-    font-weight:    700;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color:          var(--muted);
-    margin-bottom:  0.35rem;
-  }
+# ── Logo helper ────────────────────────────────────────────────────────────────
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-  /* Header bar */
-  .header-bar   { display:flex; align-items:center; gap:0.8rem; margin-bottom:1.4rem; }
-  .logo-box     { background:var(--red); color:white; font-family:'Chevin Pro','Gotham','Barlow',sans-serif;
-                  font-weight:700; font-size:1.05rem; padding:0.3rem 0.65rem;
-                  border-radius:4px; letter-spacing:0.06em; line-height:1.1; }
-  .logo-sub     { font-size:0.6rem; color:var(--muted); letter-spacing:0.14em;
-                  text-transform:uppercase; margin-top:1px; }
-  .app-title    { font-size:1.45rem; font-weight:700; color:var(--text); margin:0;
-                  font-family:'Chevin Pro','Gotham','Barlow',sans-serif; }
-
-  /* Inline chip / badge */
-  .chip { display:inline-block; background:var(--chip-bg); border:1px solid var(--border);
-          border-radius:20px; padding:0.15rem 0.6rem; font-size:0.74rem;
-          font-weight:500; color:var(--text); }
-
-  /* Expander — override Streamlit's default near-black header */
-  [data-testid="stExpander"] > details {
-    background-color: var(--bg-card) !important;
-    border:           1px solid var(--border) !important;
-    border-radius:    8px !important;
-  }
-  [data-testid="stExpander"] summary,
-  [data-testid="stExpander"] summary p,
-  [data-testid="stExpander"] summary span,
-  .streamlit-expanderHeader {
-    background-color: var(--bg-card) !important;
-    color:            var(--text)    !important;
-  }
-  [data-testid="stExpanderToggleIcon"] svg { color: var(--muted) !important; }
-
-  /* All text inside expander content */
-  [data-testid="stExpander"] p,
-  [data-testid="stExpander"] strong,
-  [data-testid="stExpander"] b {
-    color: var(--text) !important;
-  }
-
-  /* Global caption colour (Image size lines, etc.) */
-  .stCaption p,
-  [data-testid="stCaptionContainer"] p { color: var(--muted) !important; }
-
-  /* Hide Streamlit chrome */
-  #MainMenu, footer, header { visibility:hidden; }
-</style>
-"""
-st.markdown(STYLE, unsafe_allow_html=True)
+@st.cache_data
+def _logo_img(path: str = "harvia_labs_red.png") -> str:
+    # Resolve relative paths against app.py's directory so the logo works
+    # regardless of which working directory Streamlit was launched from.
+    candidates = [path, os.path.join(_APP_DIR, path)]
+    for p in candidates:
+        try:
+            with open(p, "rb") as f:
+                data = base64.b64encode(f.read()).decode()
+            ext = os.path.splitext(p)[1].lower().lstrip(".")
+            mime = "image/png" if ext == "png" else "image/jpeg"
+            return f"data:{mime};base64,{data}"
+        except OSError:
+            continue
+    return ""
 
 
-# ─── CONSTANTS ────────────────────────────────────────────────────────────────
-DEFAULT_SHADOW_FILE = "default_shadow.png"
-
-# Pixel classification thresholds
-ALPHA_THRESHOLD = 25       # below → transparent
-WHITE_THRESHOLD = 235      # all channels above → near-white (background)
-BLACK_THRESHOLD = 20       # all channels below → near-black (shadow artifact)
-
-# What fraction of the bounding-box height counts as the "ground contact zone"
-GROUND_ZONE_FRACTION = 0.25
-
-
-# ─── PIXEL CLASSIFICATION ─────────────────────────────────────────────────────
-
-def valid_pixel_mask(arr: np.ndarray) -> np.ndarray:
-    """
-    Mask for PRODUCT images.
-
-    Rejects: transparent canvas, near-white backgrounds, near-black baked shadows.
-    Keeps: any mid-tone or coloured pixel that belongs to the actual object.
-    """
-    r, g, b, a = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2], arr[:, :, 3]
-
-    is_transparent = a < ALPHA_THRESHOLD
-    is_near_white  = (r > WHITE_THRESHOLD) & (g > WHITE_THRESHOLD) & (b > WHITE_THRESHOLD)
-    is_near_black  = (r < BLACK_THRESHOLD) & (g < BLACK_THRESHOLD) & (b < BLACK_THRESHOLD)
-
-    return ~(is_transparent | is_near_white | is_near_black)
-
-
-def shadow_pixel_mask(arr: np.ndarray) -> np.ndarray:
-    """
-    Mask for SHADOW images.
-
-    Standard Photoshop shadow exports store the shadow as black (or very dark)
-    pixels with alpha controlling the density — so near-black IS the content.
-    This mask only rejects fully-transparent pixels; it keeps everything else,
-    including dark and semi-transparent pixels that form the shadow body.
-
-    Using valid_pixel_mask here would wipe the entire shadow, leaving no anchor.
-    """
-    a = arr[:, :, 3]
-    return a >= ALPHA_THRESHOLD
-
-
-# ─── BACKGROUND DETECTION & REMOVAL ──────────────────────────────────────────
-
-def has_transparency(img: Image.Image) -> bool:
-    """
-    Returns True when the image already has a meaningful transparent region.
-
-    Threshold: > 0.5 % of pixels with alpha < 200. This catches fully-cut
-    product PNGs while ignoring JPEGs and fully-opaque PNGs.
-    """
-    if img.mode not in ("RGBA", "LA", "PA"):
-        return False
-    arr = np.array(img.convert("RGBA"))
-    return bool((arr[:, :, 3] < 200).mean() > 0.005)
-
-
-def remove_solid_background(
-    img: Image.Image,
-    tolerance: int = 30,
-    corner_sample: int = 10,
-) -> Image.Image:
-    """
-    Removes a solid studio background using a trimap / alpha-matting approach.
-
-    Why the previous erode→feather approach produced dirty borders
-    --------------------------------------------------------------
-    Eroding the binary BFS mask then Gaussian-blurring it replaces the genuine
-    anti-aliased edge pixels (which contain a mix of product + background colour)
-    with artificially semi-transparent *inner* pixels.  Those inner pixels have
-    the right product colour but the wrong spatial position, producing a jagged,
-    unnatural edge.
-
-    Trimap pipeline (what this does instead)
-    -----------------------------------------
-    1. Sample corners → background colour.
-    2. Full-resolution colour-distance map  dist(x,y) = |pixel − bg_color|.
-    3. BFS flood-fill on a ≤400 px downscale → rough fg/bg split.
-    4. Upsample BFS result (NEAREST) → definite fg mask.
-    5. At full resolution define a transition zone:
-         • erode  the fg mask by TRANS_PX → definite core (alpha = 1)
-         • dilate the fg mask by TRANS_PX → outermost halo
-         • everything between core and halo = transition ring
-    6. In the transition ring: alpha = clip(dist / tolerance, 0, 1).
-       This uses the *actual per-pixel colour* to decide how opaque each
-       boundary pixel is — a pixel that is 50 % blended with the background
-       naturally gets alpha ≈ 0.5, matching the original render.
-    7. Light Gaussian smooth (radius 0.8) to remove any staircase artefacts
-       from the NEAREST-upsampled BFS boundary.
-    8. Defringe: for semi-transparent pixels, subtract background colour
-       contamination using the matting equation  Fg = (C − (1−α)·Bg) / α.
-    """
-    from collections import deque
-
-    img_rgba = img.convert("RGBA")
-    arr = np.array(img_rgba, dtype=np.float32)
-    H, W = arr.shape[:2]
-
-    # ── 1. Background colour from corners ─────────────────────────────────
-    # Sample at least 3 % of the smaller dimension so thin-border images still
-    # get an accurate background estimate.
-    c = min(max(corner_sample, int(min(H, W) * 0.03)), H // 4, W // 4)
-    corners = np.vstack([
-        arr[:c,  :c,  :3].reshape(-1, 3),
-        arr[:c,  -c:, :3].reshape(-1, 3),
-        arr[-c:, :c,  :3].reshape(-1, 3),
-        arr[-c:, -c:, :3].reshape(-1, 3),
-    ])
-    bg_color = np.median(corners, axis=0)   # (3,)
-
-    # ── 2. Full-resolution colour-distance map ─────────────────────────────
-    dist = np.sqrt(((arr[:, :, :3] - bg_color) ** 2).sum(axis=2))   # (H, W)
-    is_bg_candidate = dist <= tolerance
-
-    # ── 3. BFS flood-fill on downscaled mask ──────────────────────────────
-    WORK_SIZE = 400
-    scale = min(1.0, WORK_SIZE / max(H, W))
-    sh, sw = max(1, int(H * scale)), max(1, int(W * scale))
-
-    mask_small = np.array(
-        Image.fromarray((is_bg_candidate * 255).astype(np.uint8), "L")
-        .resize((sw, sh), Image.Resampling.NEAREST)
-    ) > 128
-
-    bg_small = np.zeros((sh, sw), dtype=bool)
+# ── BFS flood fill ─────────────────────────────────────────────────────────────
+def _bfs_background(fg_mask: np.ndarray) -> np.ndarray:
+    """BFS from all four edges. fg_mask: True=foreground. Returns True=connected background."""
+    h, w = fg_mask.shape
+    visited = np.zeros((h, w), dtype=bool)
     queue: deque = deque()
 
-    def _seed(y: int, x: int) -> None:
-        if mask_small[y, x] and not bg_small[y, x]:
-            bg_small[y, x] = True
-            queue.append((y, x))
+    def _seed(r: int, c: int) -> None:
+        if not fg_mask[r, c] and not visited[r, c]:
+            visited[r, c] = True
+            queue.append((r, c))
 
-    for y in range(sh):
-        _seed(y, 0);      _seed(y, sw - 1)
-    for x in range(sw):
-        _seed(0, x);      _seed(sh - 1, x)
+    for x in range(w):
+        _seed(0, x)
+        _seed(h - 1, x)
+    for y in range(h):
+        _seed(y, 0)
+        _seed(y, w - 1)
 
-    DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
     while queue:
-        y, x = queue.popleft()
-        for dy, dx in DIRS:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < sh and 0 <= nx < sw and not bg_small[ny, nx] and mask_small[ny, nx]:
-                bg_small[ny, nx] = True
-                queue.append((ny, nx))
+        r, c = queue.popleft()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < h and 0 <= nc < w and not visited[nr, nc] and not fg_mask[nr, nc]:
+                visited[nr, nc] = True
+                queue.append((nr, nc))
+    return visited
 
-    # ── 3b. Dilate background in lower half to absorb floor-shadow halos ────
-    # The floor shadow (medium-grey pixels too dark for the BFS to flood) sits
-    # below the product. Expanding the BG mask by ~5 px at this scale (≈15 px
-    # at full res for a 1200 px image) removes it. Limiting the dilation to the
-    # lower half keeps the upper product edges untouched.
-    split_row   = sh // 2
-    bg_lower    = bg_small.copy()
-    bg_lower[:split_row, :] = False                                 # blank upper half
-    bg_pil_low  = Image.fromarray((bg_lower * 255).astype(np.uint8), "L")
-    bg_pil_low  = bg_pil_low.filter(ImageFilter.MaxFilter(11))     # 5 px dilation
-    bg_small    = bg_small | (np.array(bg_pil_low) > 128)
 
-    # ── 4. Upsample BFS → definite fg/bg at full resolution ───────────────
-    # NEAREST preserves hard edges; the transition zone handles smoothness.
-    fg_mask = np.array(
-        Image.fromarray(((~bg_small) * 255).astype(np.uint8), "L")
-        .resize((W, H), Image.Resampling.NEAREST)
-    ) > 128
+# ── Background removal ─────────────────────────────────────────────────────────
+def remove_solid_background(img: Image.Image, tolerance: int = 30) -> Image.Image:
+    img = img.convert("RGBA")
+    arr = np.array(img, dtype=np.float32)
+    rgb = arr[:, :, :3]
+    h, w = arr.shape[:2]
 
-    # ── 5. Transition zone via full-resolution morphological ops ──────────
-    # Width scales with image size (≈1.5 % of the longer edge, capped at 30 px).
-    trans_px = min(30, max(12, int(max(H, W) * 0.015)))
-    ksize    = 2 * trans_px + 1
+    # Sample corners for background color
+    cpx = max(1, int(min(h, w) * 0.03))
+    corners = np.concatenate([
+        rgb[:cpx, :cpx].reshape(-1, 3),
+        rgb[:cpx, -cpx:].reshape(-1, 3),
+        rgb[-cpx:, :cpx].reshape(-1, 3),
+        rgb[-cpx:, -cpx:].reshape(-1, 3),
+    ])
+    bg_color = np.median(corners, axis=0)
 
-    fg_pil   = Image.fromarray((fg_mask * 255).astype(np.uint8), "L")
-    fg_core  = np.array(fg_pil.filter(ImageFilter.MinFilter(ksize))) > 128  # eroded
-    fg_halo  = np.array(fg_pil.filter(ImageFilter.MaxFilter(ksize))) > 128  # dilated
-    transition = fg_halo & ~fg_core   # the uncertain boundary ring
+    # Full-resolution color-distance map
+    dist = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
 
-    # ── 6. Compose alpha ──────────────────────────────────────────────────
-    # Core fg → 1.0 | transition → colour-distance ramp | bg → 0.0
-    alpha_dist = np.clip(dist / tolerance, 0.0, 1.0)
-    alpha = np.where(fg_core, 1.0,
-            np.where(transition, alpha_dist,
-            0.0))
+    # Downscale to max 400px on long edge for BFS
+    long_edge = max(h, w)
+    scale = min(1.0, 400.0 / long_edge)
+    dw = max(1, int(w * scale))
+    dh = max(1, int(h * scale))
 
-    # ── 7. Light Gaussian smooth ───────────────────────────────────────────
-    alpha_pil = Image.fromarray((alpha * 255).astype(np.uint8), "L")
-    alpha_pil = alpha_pil.filter(ImageFilter.GaussianBlur(radius=0.8))
-    alpha = np.array(alpha_pil, dtype=np.float32) / 255.0
+    dist_small = np.array(
+        Image.fromarray(dist.astype(np.float32)).resize((dw, dh), Image.BILINEAR)
+    )
+    fg_small = dist_small > tolerance  # True = foreground
 
-    # ── 8. Defringe ────────────────────────────────────────────────────────
-    # Matting equation: Fg = (C − (1−α)·Bg) / α
-    rgb  = arr[:, :, :3].copy()
+    # Dilate background in lower half by eroding foreground with 11px MinFilter
+    half_row = dh // 2
+    fg_lower_pil = Image.fromarray(fg_small[half_row:, :].astype(np.uint8) * 255)
+    fg_lower_eroded = np.array(fg_lower_pil.filter(ImageFilter.MinFilter(11))) > 127
+    fg_small[half_row:, :] = fg_lower_eroded
+
+    # BFS from edges to find connected background
+    bg_small = _bfs_background(fg_small)
+
+    # Upsample background mask to full resolution
+    bg_full = np.array(
+        Image.fromarray(bg_small.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)
+    ) > 127
+    fg_full = ~bg_full
+
+    # Transition zone: erode and dilate fg_mask by trans_px
+    trans_px = int(max(h, w) * 0.015)
+    trans_px = max(12, min(30, trans_px))
+    ksize = trans_px * 2 + 1
+
+    fg_pil = Image.fromarray(fg_full.astype(np.uint8) * 255)
+    core = np.array(fg_pil.filter(ImageFilter.MinFilter(ksize))) > 127
+    halo = np.array(fg_pil.filter(ImageFilter.MaxFilter(ksize))) > 127
+    transition = halo & ~core
+
+    # Build alpha: core=1, bg=0, transition=color-distance blend
+    alpha = np.zeros((h, w), dtype=np.float32)
+    alpha[core] = 1.0
+    alpha[transition] = np.clip(dist[transition] / max(float(tolerance), 1.0), 0.0, 1.0)
+
+    # Smooth staircase artifacts
+    alpha_pil = Image.fromarray((alpha * 255).astype(np.uint8))
+    alpha = np.array(alpha_pil.filter(ImageFilter.GaussianBlur(radius=0.8))).astype(np.float32) / 255.0
+
+    # Defringe: remove background color contamination from semi-transparent pixels
     semi = (alpha > 0.01) & (alpha < 0.99)
-    if semi.any():
-        a3  = alpha[:, :, np.newaxis]
+    if np.any(semi):
+        a3 = alpha[:, :, np.newaxis]
         bg3 = bg_color[np.newaxis, np.newaxis, :]
-        fg  = (rgb - (1.0 - a3) * bg3) / np.clip(a3, 0.01, 1.0)
-        rgb = np.where(semi[:, :, np.newaxis], np.clip(fg, 0, 255), rgb)
+        defringe = (rgb - (1.0 - a3) * bg3) / np.maximum(a3, 0.01)
+        rgb = np.where(semi[:, :, np.newaxis], np.clip(defringe, 0.0, 255.0), rgb)
 
-    # ── Assemble RGBA ──────────────────────────────────────────────────────
-    out          = np.zeros((H, W, 4), dtype=np.uint8)
-    out[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
-    out[:, :,  3] = np.clip(alpha * 255, 0, 255).astype(np.uint8)
-    return Image.fromarray(out, "RGBA")
-
-
-# ─── VISUAL CORNER DETECTION ─────────────────────────────────────────────────
-
-def find_solid_base_row(mask: np.ndarray) -> int:
-    """
-    Returns the y-coordinate (row) of the lowest row that still belongs to the
-    SOLID object body, ignoring any baked-in ground shadow below it.
-
-    Many product renders ship with a soft elliptical floor shadow already
-    composited into the PNG. That shadow appears as rows of *sparse* valid pixels
-    at the very bottom of the image — the shadow fades/tapers outward. The actual
-    object feet sit above those sparse rows in dense, high-coverage rows.
-
-    Algorithm
-    ---------
-    1. Count valid pixels per row.
-    2. Determine the peak density inside the upper 70 % of the image (the body).
-    3. Define "solid" as ≥ DENSITY_FRACTION × peak. Rows below that are sparse
-       (ground shadow, taper, or anti-alias fringe).
-    4. Scan from the bottom up; return the first row that qualifies as solid.
-
-    This lets the anchor search ignore the baked-in shadow and land on the
-    actual feet of the object.
-    """
-    DENSITY_FRACTION = 0.08   # a row must have ≥ 8 % of peak density to count
-
-    H = mask.shape[0]
-    row_counts = mask.sum(axis=1).astype(float)   # valid pixels per row
-
-    # Reference peak: look only at the top 70 % to avoid the shadow region biasing it
-    body_counts = row_counts[: max(1, int(H * 0.70))]
-    peak = body_counts.max()
-
-    if peak == 0:
-        return H - 1  # no valid pixels at all
-
-    threshold = peak * DENSITY_FRACTION
-
-    for row in range(H - 1, -1, -1):
-        if row_counts[row] >= threshold:
-            return row
-
-    return H - 1
+    result = np.zeros((h, w, 4), dtype=np.uint8)
+    result[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+    result[:, :, 3] = (alpha * 255).astype(np.uint8)
+    return Image.fromarray(result, "RGBA")
 
 
-def _bottom_profile(mask: np.ndarray) -> np.ndarray:
-    """
-    For every column x, returns the row index of the bottommost valid pixel,
-    or -1 if the column has no valid pixels at all.
-
-    This gives the "silhouette ground line" — how close each vertical strip of
-    the object comes to the floor — which is the foundation for corner detection.
-    """
-    H = mask.shape[0]
-    has_any = mask.any(axis=0)                           # (W,) bool
-    # argmax on the vertically-flipped mask finds the first True from the bottom
-    dist_from_bottom = np.argmax(mask[::-1, :], axis=0)  # (W,) int
-    bottom_rows = H - 1 - dist_from_bottom
-    return np.where(has_any, bottom_rows, -1).astype(int)
-
-
-def find_bottom_left_anchor(img: Image.Image) -> Optional[Tuple[int, int]]:
-    """
-    Finds the visual bottom-left corner of the product — where the perspective
-    shadow attaches to the object's front-left foot.
-
-    Why the old "leftmost pixel in bottom zone" approach failed
-    -----------------------------------------------------------
-    On a perspective box (e.g. a sauna viewed from the front-right), the back-left
-    wall extends furthest left in the image, but its bottom edge sits HIGH UP due
-    to perspective foreshortening. "Leftmost pixel in bottom zone" can land on
-    that distant wall — not the front foot.
-
-    Correct Photoshop-artist reasoning
-    -----------------------------------
-    A retoucher asks: "Which is the leftmost column that still touches the ground?"
-    The front-left foot IS leftward AND reaches the global base of the object.
-    The back wall is leftward but does NOT reach that low.
-
-    Algorithm (bottom-profile approach)
-    ------------------------------------
-    1. Build a per-column "bottom profile": bottommost valid pixel in each column.
-    2. Find the global bottom row (max of the profile).
-    3. Accept columns whose bottom pixel is within TOLERANCE of that global bottom.
-       Tight tolerance (3 % of object height, min 8 px) rejects the back wall
-       whose bottom sits noticeably higher due to perspective.
-    4. The leftmost accepted column is the front-left foot.
-    """
-    arr  = np.array(img.convert("RGBA"))
-    mask = valid_pixel_mask(arr)
-    prof = _bottom_profile(mask)
-
-    valid_cols = np.where(prof >= 0)[0]
-    if len(valid_cols) == 0:
-        return None
-
-    # ── Column-density guard ───────────────────────────────────────────────
-    # Sparse columns (floor-shadow remnants, anti-alias fringe) contain very
-    # few valid pixels vertically. Real object columns span a meaningful
-    # fraction of the image height. Filtering them out prevents the anchor
-    # from landing on a shadow patch that extends below the product feet.
-    col_counts    = mask.sum(axis=0)                       # valid px per column
-    min_col_count = max(3, int(mask.shape[0] * 0.02))     # ≥ 2 % of image height
-    valid_cols    = valid_cols[col_counts[valid_cols] >= min_col_count]
-    if len(valid_cols) == 0:
-        return None
-
-    global_bottom = int(prof[valid_cols].max())
-
-    # Tolerance: how far above global_bottom still counts as "on the ground"
-    top_rows   = np.where(mask.any(axis=1))[0]
-    obj_height = global_bottom - int(top_rows.min()) if len(top_rows) > 0 else 100
-    tolerance  = max(8, int(obj_height * 0.03))   # 3 % of height, min 8 px
-
-    candidates = valid_cols[prof[valid_cols] >= global_bottom - tolerance]
-    if len(candidates) == 0:
-        candidates = valid_cols
-
-    anchor_x = int(candidates.min())
-    anchor_y = int(prof[anchor_x])
-    return anchor_x, anchor_y
-
-
-def find_bottom_right_anchor(img: Image.Image) -> Optional[Tuple[int, int]]:
-    """
-    Finds the visual bottom-right corner of the shadow image — the tip that is
-    pinned to the product's front-left foot.
-
-    Mirror of find_bottom_left_anchor: we want the RIGHTMOST column that still
-    reaches the global bottom of the shadow. This is the dense attachment edge of
-    a perspective shadow (the far-left tip tapers away from the object and sits
-    higher, so it is correctly rejected by the tolerance filter).
-
-    Uses shadow_pixel_mask (not valid_pixel_mask) because shadow PNGs are
-    typically black pixels with alpha — keeping only non-transparent pixels.
-    """
-    arr  = np.array(img.convert("RGBA"))
-    mask = shadow_pixel_mask(arr)
-    prof = _bottom_profile(mask)
-
-    valid_cols = np.where(prof >= 0)[0]
-    if len(valid_cols) == 0:
-        return None
-
-    global_bottom = int(prof[valid_cols].max())
-
-    top_rows   = np.where(mask.any(axis=1))[0]
-    obj_height = global_bottom - int(top_rows.min()) if len(top_rows) > 0 else 100
-    tolerance  = max(8, int(obj_height * 0.03))
-
-    candidates = valid_cols[prof[valid_cols] >= global_bottom - tolerance]
-    if len(candidates) == 0:
-        candidates = valid_cols
-
-    anchor_x = int(candidates.max())
-    anchor_y = int(prof[anchor_x])
-    return anchor_x, anchor_y
-
-
+# ── Baked shadow stripping ─────────────────────────────────────────────────────
 def strip_baked_shadow(img: Image.Image) -> Image.Image:
-    """
-    Crops the product image so that any baked-in floor shadow below the solid
-    object base is removed. The result is the product isolated to its body,
-    ready for the compositor to attach a clean new shadow.
+    arr = np.array(img.convert("RGBA"))
+    h, w = arr.shape[:2]
+    alpha = arr[:, :, 3]
+    rgb = arr[:, :, :3]
 
-    Uses find_solid_base_row() to locate the crop line, then adds a small
-    margin so anti-aliased pixels at the feet aren't clipped.
+    valid = (
+        (alpha > 20)
+        & ~np.all(rgb > 235, axis=2)
+        & ~np.all(rgb < 20, axis=2)
+    )
+
+    row_counts = np.sum(valid, axis=1)
+    top70 = max(1, int(h * 0.7))
+    peak = max(1, int(np.max(row_counts[:top70])))
+
+    solid_base_row = 0
+    for r in range(h - 1, -1, -1):
+        if row_counts[r] >= 0.08 * peak:
+            solid_base_row = r
+            break
+
+    margin = max(20, int(h * 0.03))
+    crop_row = min(solid_base_row + margin, h)
+    return img.crop((0, 0, w, crop_row))
+
+
+# ── Anchor detection ───────────────────────────────────────────────────────────
+def find_bottom_left_anchor(img: Image.Image) -> tuple:
+    """Ray-sweep from the lower-left at ANCHOR_RAY_ANGLE degrees from vertical.
+
+    For each valid pixel (x, y) the signed projection onto the sweep direction is:
+        proj = x * sin(theta) - y * cos(theta)
+
+    Pixels further left OR further down both decrease this value, so the pixel
+    with the minimum projection is the one hit first by the approaching sweep
+    line — always the true floor-contact bottom-left corner:
+
+      * Barrel sauna: foot corner beats the circular-arc fringe because the foot
+        is lower (large y drives the -y*cos term well below the fringe value).
+      * Perspective box: left face beats the centre-bottom pixel because it is
+        further left; the slight height difference is outweighed at 30 deg.
+      * Baked shadow extension: sits higher than the product base, so its
+        projection is larger and is never selected.
     """
     arr = np.array(img.convert("RGBA"))
-    mask = valid_pixel_mask(arr)
-    base_row = find_solid_base_row(mask)
+    h, w = arr.shape[:2]
+    alpha, rgb = arr[:, :, 3], arr[:, :, :3]
 
-    # Breathing-room margin so anti-aliased foot pixels aren't clipped
-    margin = max(20, int(img.height * 0.03))
-    crop_bottom = min(base_row + margin, img.height)
-    return img.crop((0, 0, img.width, crop_bottom))
+    valid = (alpha > 100) & ~np.all(rgb > 235, axis=2)
+    if not np.any(valid):
+        return (0, h - 1)
+
+    theta = np.radians(ANCHOR_RAY_ANGLE)
+    ys, xs = np.where(valid)
+    proj = xs.astype(np.float64) * np.sin(theta) - ys.astype(np.float64) * np.cos(theta)
+    idx = int(np.argmin(proj))
+    return (int(xs[idx]), int(ys[idx]))
 
 
-# ─── COMPOSITING ──────────────────────────────────────────────────────────────
+def find_bottom_right_anchor(img: Image.Image) -> tuple:
+    """Mirror of find_bottom_left_anchor: ray-sweep from the lower-right.
 
-def composite(
-    product_img:  Image.Image,
-    shadow_img:   Image.Image,
-    shadow_scale: float = 0.8,
-    offset_x:     int = 0,
-    offset_y:     int = 0,
-    strip_shadow: bool = True,
-    bg_tolerance: int = 30,
-) -> Image.Image:
+    Projection: proj = x * sin(theta) + y * cos(theta)
+    Pixels further right OR further down get a larger projection and are hit
+    first, giving the shadow's floor-contact bottom-right corner.
     """
-    Main compositing function.
+    arr = np.array(img.convert("RGBA"))
+    h, w = arr.shape[:2]
 
-    Steps
-    -----
-    0. If the product has no transparency, auto-remove its solid background.
-    1. Convert to RGBA. Optionally strip the baked-in floor shadow.
-    2. Crop both images to tight bounding boxes.
-    3. Scale the shadow so its width = shadow_scale × product_width.
-    4. Detect anchors (product bottom-left, shadow bottom-right).
-    5. Compute where the shadow's top-left pixel must be placed so the anchors
-       coincide. Apply offset_x / offset_y fine-tuning.
-    6. Build a canvas large enough to contain both images without cropping.
-    7. Paste shadow first (background layer), then product (foreground).
-    8. Trim transparent borders and return.
+    valid = arr[:, :, 3] >= 25  # shadow pixels: any with alpha >= 25
+    if not np.any(valid):
+        return (w - 1, h - 1)
 
-    Parameters
-    ----------
-    product_img  : Source product image (any mode; converted to RGBA internally).
-    shadow_img   : Source shadow image (PNG with alpha channel recommended).
-    shadow_scale : shadow_width = shadow_scale × product_bounding_box_width.
-    offset_x     : Pixel nudge for the shadow position (positive = right).
-    offset_y     : Pixel nudge for the shadow position (positive = down).
-    strip_shadow : When True, auto-remove any baked-in floor shadow from the
-                   product before compositing.
+    theta = np.radians(SHADOW_RAY_ANGLE)
+    ys, xs = np.where(valid)
+    proj = xs.astype(np.float64) * np.sin(theta) + ys.astype(np.float64) * np.cos(theta)
+    idx = int(np.argmax(proj))
+    return (int(xs[idx]), int(ys[idx]))
+
+
+# ── Debug helpers ──────────────────────────────────────────────────────────────
+def draw_crosshair(img: Image.Image, anchor: tuple, color: tuple = (255, 40, 40)) -> Image.Image:
+    img = img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(img)
+    x, y = anchor
+    w = img.size[0]
+    r = max(6, min(18, w // 50))
+    arm = r * 3
+    c = color + (255,)
+    draw.line([(x - arm, y), (x + arm, y)], fill=c, width=2)
+    draw.line([(x, y - arm), (x, y + arm)], fill=c, width=2)
+    draw.ellipse([(x - r, y - r), (x + r, y + r)], fill=c)
+    return img
+
+
+def make_checkerboard_bg(size: tuple, tile: int = 16) -> Image.Image:
+    w, h = size
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    arr[:, :, 3] = 255
+    for row in range(0, h, tile):
+        for col in range(0, w, tile):
+            v = 220 if ((row // tile) + (col // tile)) % 2 == 0 else 180
+            arr[row:row + tile, col:col + tile, :3] = v
+    return Image.fromarray(arr, "RGBA")
+
+
+# ── Compositing (two-stage: heavy prepare + light assemble) ────────────────────
+def prepare_layers(
+    product_img: Image.Image,
+    shadow_img: Image.Image,
+    shadow_scale: float,
+    tolerance: int,
+) -> tuple:
+    """Heavy stage: background removal, baked-shadow strip, anchor detection.
+    Output feeds assemble_composite, which is cheap and re-runnable for offset tuning.
+
+    Returns: (prod, shad, prod_anchor, shad_anchor)
     """
-
-    # ── 0. Auto background removal ────────────────────────────────────────
-    # If the product image has no transparent region it's a flat JPEG / shot-
-    # on-white PNG. Remove the solid background first so the compositing and
-    # anchor detection work on a clean cutout.
     prod = product_img.convert("RGBA")
-    if not has_transparency(prod):
-        prod = remove_solid_background(prod, tolerance=bg_tolerance)
+
+    arr = np.array(prod)
+    if np.mean(arr[:, :, 3] < 200) < 0.005:
+        prod = remove_solid_background(prod, tolerance)
 
     shad = shadow_img.convert("RGBA")
+    prod = strip_baked_shadow(prod)
 
-    # ── 1. Optionally strip the existing floor shadow ─────────────────────
-    if strip_shadow:
-        prod = strip_baked_shadow(prod)
+    prod_bbox = prod.getbbox()
+    if prod_bbox is None:
+        empty = product_img.convert("RGBA")
+        return empty, shad, (0, 0), (0, 0)
+    prod = prod.crop(prod_bbox)
 
-    p_bbox = prod.getbbox()
-    s_bbox = shad.getbbox()
+    shad_bbox = shad.getbbox()
+    if shad_bbox is None:
+        return prod, shad, (0, prod.height - 1), (shadow_img.width - 1, shadow_img.height - 1)
+    shad = shad.crop(shad_bbox)
 
-    # If either image is entirely transparent, return the product as-is
-    if p_bbox is None or s_bbox is None:
-        return prod
+    pw, _ = prod.size
+    sw, sh = shad.size
+    target_w = max(1, int(shadow_scale * pw))
+    target_h = max(1, int(target_w * sh / max(sw, 1)))
+    shad = shad.resize((target_w, target_h), Image.LANCZOS)
 
-    prod = prod.crop(p_bbox)
-    shad = shad.crop(s_bbox)
+    prod_anchor = find_bottom_left_anchor(prod)
+    shad_anchor = find_bottom_right_anchor(shad)
+    return prod, shad, prod_anchor, shad_anchor
 
+
+def assemble_composite(
+    prod: Image.Image,
+    shad: Image.Image,
+    prod_anchor: tuple,
+    shad_anchor: tuple,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    bg_color: str | None = None,
+    margin: int = 0,
+) -> Image.Image:
+    """Light stage: paste pre-prepared layers, apply offset, bg fill, margin."""
     pw, ph = prod.size
-
-    # ── 2. Scale shadow ────────────────────────────────────────────────────
-    target_w = max(1, int(pw * shadow_scale))
-    aspect   = shad.height / shad.width
-    target_h = max(1, int(target_w * aspect))
-    shad = shad.resize((target_w, target_h), Image.Resampling.LANCZOS)
     sw, sh = shad.size
 
-    # ── 3. Detect anchors ──────────────────────────────────────────────────
-    p_anchor = find_bottom_left_anchor(prod)
-    s_anchor = find_bottom_right_anchor(shad)
+    shadow_left = prod_anchor[0] - shad_anchor[0] + offset_x
+    shadow_top = prod_anchor[1] - shad_anchor[1] + offset_y
+    prod_left, prod_top = 0, 0
 
-    # Geometric fallbacks if detection finds no valid pixels
-    if p_anchor is None:
-        p_anchor = (0, ph - 1)
-    if s_anchor is None:
-        s_anchor = (sw - 1, sh - 1)
+    if shadow_left < 0:
+        prod_left = -shadow_left
+        shadow_left = 0
+    if shadow_top < 0:
+        prod_top = -shadow_top
+        shadow_top = 0
 
-    pcx, pcy = p_anchor  # product corner (in cropped product space)
-    sax, say = s_anchor  # shadow anchor  (in scaled shadow space)
+    canvas_w = max(prod_left + pw, shadow_left + sw)
+    canvas_h = max(prod_top + ph, shadow_top + sh)
 
-    # ── 4. Shadow placement ────────────────────────────────────────────────
-    # We want the shadow's anchor pixel to land exactly on the product's anchor
-    # pixel. The shadow's top-left is therefore at (pcx - sax, pcy - say)
-    # relative to the product's top-left, plus any fine-tune offsets.
-    spx = pcx - sax + offset_x
-    spy = pcy - say + offset_y
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    canvas.paste(shad, (shadow_left, shadow_top), shad)
+    canvas.paste(prod, (prod_left, prod_top), prod)
 
-    # ── 5. Dynamic canvas ──────────────────────────────────────────────────
-    # Product occupies [0, pw) × [0, ph) in its own coordinate system.
-    # Shadow occupies  [spx, spx+sw) × [spy, spy+sh).
-    cx0 = min(0, spx)
-    cy0 = min(0, spy)
-    cx1 = max(pw, spx + sw)
-    cy1 = max(ph, spy + sh)
+    bbox = canvas.getbbox()
+    if bbox:
+        canvas = canvas.crop(bbox)
 
-    canvas = Image.new("RGBA", (cx1 - cx0, cy1 - cy0), (0, 0, 0, 0))
+    if bg_color:
+        try:
+            bg_rgb = ImageColor.getrgb(bg_color)[:3]
+            bg_img = Image.new("RGBA", canvas.size, bg_rgb + (255,))
+            bg_img.paste(canvas, (0, 0), canvas)
+            canvas = bg_img
+        except Exception:
+            pass
 
-    # Convert to canvas-relative coordinates
-    p_x = -cx0
-    p_y = -cy0
-    s_x = spx - cx0
-    s_y = spy - cy0
-
-    # ── 6. Composite ───────────────────────────────────────────────────────
-    canvas.paste(shad, (s_x, s_y), shad)  # shadow → background layer
-    canvas.paste(prod, (p_x, p_y), prod)  # product → foreground layer
-
-    # ── 7. Trim transparent borders ────────────────────────────────────────
-    final_bbox = canvas.getbbox()
-    if final_bbox:
-        canvas = canvas.crop(final_bbox)
+    if margin > 0:
+        mw = canvas.width + 2 * margin
+        mh = canvas.height + 2 * margin
+        if bg_color:
+            try:
+                bg_rgb = ImageColor.getrgb(bg_color)[:3]
+                bg_canvas = Image.new("RGBA", (mw, mh), bg_rgb + (255,))
+            except Exception:
+                bg_canvas = Image.new("RGBA", (mw, mh), (0, 0, 0, 0))
+        else:
+            bg_canvas = Image.new("RGBA", (mw, mh), (0, 0, 0, 0))
+        bg_canvas.paste(canvas, (margin, margin), canvas)
+        canvas = bg_canvas
 
     return canvas
 
 
-# ─── UTILITY ──────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def _prepare_layers_cached(
+    product_bytes: bytes,
+    shadow_bytes: bytes,
+    shadow_scale: float,
+    tolerance: int,
+) -> tuple:
+    """Cached entry point — keyed by file bytes + scale + tolerance.
+    Survives reruns; invalidated only when one of the inputs actually changes."""
+    prod_img = Image.open(io.BytesIO(product_bytes))
+    shad_img = Image.open(io.BytesIO(shadow_bytes))
+    return prepare_layers(prod_img, shad_img, shadow_scale, tolerance)
 
-def to_png_bytes(img: Image.Image) -> bytes:
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+def render_sidebar() -> tuple:
+    with st.sidebar:
+        logo_src = _logo_img("harvia_labs_red.png")
+        if logo_src:
+            st.markdown(
+                f'<div style="padding-top:1rem;margin-bottom:1.1rem;">'
+                f'<img src="{logo_src}" style="height:46px;" alt="Harvia Labs"/>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div class="section-label" style="padding-top:1.1rem;">Shadow Scale</div>', unsafe_allow_html=True)
+        shadow_scale = st.slider(
+            "Shadow Scale", 0.10, 1.5, 0.50, 0.025,
+            label_visibility="collapsed",
+            help="Shadow width as multiple of product bbox width",
+        )
+        st.caption(f"Shadow Scale: {shadow_scale:.3f}")
+
+        st.markdown("---")
+        st.markdown('<div class="section-label">BG Removal Tolerance</div>', unsafe_allow_html=True)
+        bg_tolerance = st.slider(
+            "BG Removal Tolerance", 5, 80, 30, 1,
+            label_visibility="collapsed",
+            help="Max color distance from detected background",
+        )
+        st.caption(f"Tolerance: {bg_tolerance}")
+
+        st.markdown("---")
+        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
+        add_bg = st.checkbox("Add background colour", value=False)
+        bg_color_val: str | None = None
+        if add_bg:
+            bg_color_val = st.color_picker("Background colour", "#EAE8E0")
+
+        out_margin = st.slider(
+            "Margin (px)", 0, 300, 0, 5,
+            label_visibility="collapsed",
+            help="Padding around the final image",
+        )
+        st.caption(f"Margin: {out_margin} px")
+
+        st.markdown("---")
+        st.markdown(
+            '<p style="font-size:0.68rem;">'
+            'Place <code>default_shadow.png</code> in the working directory to auto-load it as the default shadow.'
+            '</p>',
+            unsafe_allow_html=True,
+        )
+
+    return shadow_scale, bg_tolerance, add_bg, bg_color_val, out_margin
+
+
+# ── Header ─────────────────────────────────────────────────────────────────────
+def render_header() -> None:
+    logo_src = _logo_img("harvia_labs_red.png")
+    logo_html = (
+        f'<img src="{logo_src}" style="height:58px;display:block;" alt="Harvia Labs"/>'
+        if logo_src else ""
+    )
+    st.markdown(f"""<div class="header-bar">
+  {logo_html}
+  <div style="border-left:2px solid #D9D6C8;padding-left:0.8rem;">
+    <div style="font-family:'Gotham','Barlow',sans-serif;font-weight:700;font-size:1.6rem;color:#505045;line-height:1.2;">
+      Cast-a-shadow
+      <span style="font-family:'Chevin Pro','Barlow',sans-serif;font-size:1rem;color:#727266;letter-spacing:0.04em;font-weight:400;"> beta</span>
+    </div>
+    <div style="font-size:0.78rem;color:#727266;margin-top:0.15rem;">Automated perspective-shadow compositing for product images</div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with st.expander("How it works"):
+        st.markdown("""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem 2rem;padding:0.25rem 0;">
+
+<div>
+<div class="section-label">1 · Background removal</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">Corner pixels are sampled to detect the background colour. A BFS flood-fill from all four edges builds a mask, and a Gaussian-smoothed trimap blend removes the background while preserving semi-transparent edges.</p>
+</div>
+
+<div>
+<div class="section-label">2 · Floor contact anchor</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">A sweep line at 30° from vertical scans all solid product pixels. The pixel with the lowest projection value — furthest left <em>and</em> down — is chosen as the floor contact point. This reliably finds the bottom-left corner regardless of product shape.</p>
+</div>
+
+<div>
+<div class="section-label">3 · Shadow anchor</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The same ray-sweep logic at 10° from vertical finds the shadow's bottom-right floor contact point — the pixel furthest right and down. Both angles are tunable constants in the code.</p>
+</div>
+
+<div>
+<div class="section-label">4 · Compositing</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The two anchors are aligned on a shared canvas — the shadow behind, the product on top. Shadow width scales as a multiple of the product bounding-box width. Each result has its own X/Y micro-adjustment in the debug panel for fine-tuning.</p>
+</div>
+
+</div>
+""", unsafe_allow_html=True)
+
+
+# ── Utils ──────────────────────────────────────────────────────────────────────
+def img_to_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
-def load_default_shadow() -> Optional[Image.Image]:
-    """Load default_shadow.png from the working directory, if present."""
-    if os.path.exists(DEFAULT_SHADOW_FILE):
-        try:
-            return Image.open(DEFAULT_SHADOW_FILE)
-        except Exception:
-            pass
-    return None
+def create_zip(items: list[tuple[str, Image.Image]]) -> bytes:
+    """Pack a list of (filename, PIL image) pairs into an in-memory ZIP."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, img in items:
+            zf.writestr(filename, img_to_bytes(img))
+    return buf.getvalue()
 
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
-
-LOGO_FILE = "harvia_labs_red.png"
-
-@st.cache_data
-def _logo_b64() -> str:
-    """Base64-encode the Harvia Labs logo once; cached across reruns."""
-    if os.path.exists(LOGO_FILE):
-        with open(LOGO_FILE, "rb") as fh:
-            return base64.b64encode(fh.read()).decode()
-    return ""
-
-
-def _logo_img(height_px: int = 52, style: str = "") -> str:
-    """Return an <img> tag for the Harvia Labs logo, or empty string if missing."""
-    b64 = _logo_b64()
-    if not b64:
-        return ""
-    return (
+# ── Image display helper ───────────────────────────────────────────────────────
+def _show_image(img: Image.Image, max_h: int = 600) -> None:
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    st.markdown(
         f'<img src="data:image/png;base64,{b64}" '
-        f'style="height:{height_px}px;width:auto;{style}" alt="Harvia Labs">'
+        f'style="max-height:{max_h}px;max-width:100%;width:auto;height:auto;'
+        f'display:block;margin:1.5rem auto;" />',
+        unsafe_allow_html=True,
     )
 
 
-def render_sidebar() -> Tuple[float, int, int, int, bool, str, int]:
-    """Render sidebar controls; return (shadow_scale, offset_x, offset_y, bg_tolerance, add_bg, bg_hex, margin_px)."""
-    with st.sidebar:
+# ── Per-image result renderer ──────────────────────────────────────────────────
+def _render_result(
+    key: str,
+    stem: str,
+    prod: Image.Image,
+    shad: Image.Image,
+    prod_anchor: tuple,
+    shad_anchor: tuple,
+    bg_color: str | None,
+    margin: int,
+    dl_key_suffix: str,
+) -> Image.Image:
+    """Render one composited result with its own micro-adjustment controls.
+    Reads `(applied_x, applied_y)` from session state and applies them to the cached
+    layers. Number inputs adjust pending values; only the Apply button commits."""
+    offsets = st.session_state.setdefault("offsets", {})
+    applied_x, applied_y = offsets.get(key, (0, 0))
+
+    output_img = assemble_composite(
+        prod, shad, prod_anchor, shad_anchor,
+        applied_x, applied_y, bg_color, margin,
+    )
+    _show_image(output_img)
+
+    with st.expander("Anchor debug & micro-adjustment — click to fine-tune"):
+        # ── Adjustment controls ────────────────────────────────────────────────
+        st.markdown('<div class="section-label">Micro-adjustment (per image)</div>', unsafe_allow_html=True)
+        adj_cols = st.columns([1, 1, 1, 1])
+        with adj_cols[0]:
+            pending_x = st.number_input(
+                "X offset (px)", value=applied_x, step=1,
+                key=f"x_{key}", help="Nudge shadow horizontally",
+            )
+        with adj_cols[1]:
+            pending_y = st.number_input(
+                "Y offset (px)", value=applied_y, step=1,
+                key=f"y_{key}", help="Nudge shadow vertically",
+            )
+        pending = (int(pending_x), int(pending_y))
+        is_pending = pending != (applied_x, applied_y)
+        with adj_cols[2]:
+            st.markdown('<div style="height:1.65rem;"></div>', unsafe_allow_html=True)
+            if st.button(
+                "Apply", key=f"apply_{key}",
+                use_container_width=True, disabled=not is_pending,
+                type="primary" if is_pending else "secondary",
+            ):
+                offsets[key] = pending
+                st.rerun()
+        with adj_cols[3]:
+            st.markdown('<div style="height:1.65rem;"></div>', unsafe_allow_html=True)
+            if st.button(
+                "Reset", key=f"reset_{key}",
+                use_container_width=True, disabled=(applied_x == 0 and applied_y == 0),
+            ):
+                offsets[key] = (0, 0)
+                st.rerun()
+
+        # ── Live preview of pending change ────────────────────────────────────
+        if is_pending:
+            st.markdown(
+                '<div class="section-label" style="margin-top:0.6rem;">'
+                'Preview (click Apply to commit)</div>',
+                unsafe_allow_html=True,
+            )
+            preview_img = assemble_composite(
+                prod, shad, prod_anchor, shad_anchor,
+                pending[0], pending[1], bg_color, margin,
+            )
+            _show_image(preview_img, max_h=380)
+
+        # ── Anchor crosshairs ─────────────────────────────────────────────────
         st.markdown(
-            f'<div style="margin-bottom:0.6rem;">{_logo_img(height_px=46)}</div>',
+            '<div class="section-label" style="margin-top:0.8rem;">Anchor placement</div>',
             unsafe_allow_html=True,
         )
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            st.markdown('<div class="section-label">Product anchor</div>', unsafe_allow_html=True)
+            st.image(draw_crosshair(prod, prod_anchor), use_container_width=True)
+            st.code(f"x={prod_anchor[0]}, y={prod_anchor[1]}")
+            st.caption(f"Image size: {prod.size[0]}×{prod.size[1]}")
+        with dcol2:
+            st.markdown('<div class="section-label">Shadow anchor</div>', unsafe_allow_html=True)
+            checker = make_checkerboard_bg(shad.size)
+            checker.paste(shad, (0, 0), shad)
+            st.image(draw_crosshair(checker, shad_anchor), use_container_width=True)
+            st.code(f"x={shad_anchor[0]}, y={shad_anchor[1]}")
+            st.caption(f"Image size: {shad.size[0]}×{shad.size[1]}")
 
-        st.markdown('<div class="section-label">Shadow Scale</div>', unsafe_allow_html=True)
-        shadow_scale = st.slider(
-            "shadow_scale",
-            min_value=0.1, max_value=1.5, value=0.5, step=0.025,
-            help="Shadow width as a multiple of the product's bounding-box width.",
-            label_visibility="collapsed",
-        )
-        st.caption(f"{shadow_scale:.3f}× product width")
+    st.download_button(
+        "Download PNG",
+        data=img_to_bytes(output_img),
+        file_name=f"{stem}_shadow.png",
+        mime="image/png",
+        use_container_width=True,
+        key=f"dl_{dl_key_suffix}",
+    )
+    return output_img
 
-        st.markdown("---")
-        st.markdown('<div class="section-label">BG Removal Tolerance</div>', unsafe_allow_html=True)
-        bg_tolerance = st.slider(
-            "bg_tolerance",
-            min_value=5, max_value=80, value=30, step=1,
-            help="Max colour distance from detected background. Raise if BG isn't "
-                 "fully removed; lower if product edges are being eaten.",
-            label_visibility="collapsed",
-        )
-        st.caption(f"Tolerance: {bg_tolerance}")
 
-        st.markdown("---")
-        st.markdown('<div class="section-label">Anchor Offset (px)</div>', unsafe_allow_html=True)
-        offset_x = st.slider(
-            "X offset", min_value=-300, max_value=300, value=0, step=1,
-            help="Horizontal nudge for shadow alignment.",
-            label_visibility="collapsed",
-        )
-        offset_y = st.slider(
-            "Y offset", min_value=-300, max_value=300, value=0, step=1,
-            help="Vertical nudge for shadow alignment.",
-            label_visibility="collapsed",
-        )
-        st.caption(f"X: {offset_x:+d} px  ·  Y: {offset_y:+d} px")
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main() -> None:
+    inject_css()
 
-        st.markdown("---")
-        st.markdown('<div class="section-label">Output</div>', unsafe_allow_html=True)
-        add_bg = st.checkbox(
-            "Add background colour", value=False,
-            help="Composite over a solid colour instead of exporting transparent PNG.",
-        )
-        bg_hex = "#F0EDE6"
-        if add_bg:
-            bg_hex = st.color_picker("Colour", value="#F0EDE6", label_visibility="collapsed")
-        margin_px = st.slider(
-            "Margin (px)", min_value=0, max_value=300, value=0, step=5,
-            help="Padding added around the final image.",
-            label_visibility="collapsed",
-        )
-        st.caption(f"Margin: {margin_px} px")
+    shadow_scale, bg_tolerance, add_bg, bg_color_val, out_margin = render_sidebar()
+    render_header()
 
-        st.markdown("---")
+    upload_row, _ = st.columns([3, 1])
+    col1, col2 = upload_row.columns(2, gap="medium")
+    with col1:
         st.markdown(
-            '<div style="font-size:0.72rem;color:var(--muted);line-height:1.5;">'
-            'Place <code>default_shadow.png</code> in the app folder to load it automatically.'
+            '<div style="height:1.55rem;display:flex;align-items:center;margin-bottom:0.35rem;">'
+            '<span class="section-label" style="margin-bottom:0;">Product Image</span>'
             '</div>',
             unsafe_allow_html=True,
         )
-
-    return shadow_scale, offset_x, offset_y, bg_tolerance, add_bg, bg_hex, margin_px
-
-
-def render_header() -> None:
-    logo = _logo_img(height_px=58, style="display:block;")
-    st.markdown(
-        f'<div class="header-bar" style="align-items:center;gap:1.2rem;margin-bottom:1.6rem;">'
-        f'  <div style="flex-shrink:0;">{logo}</div>'
-        f'  <div style="border-left:2px solid var(--border);padding-left:1.1rem;">'
-        f'    <p class="app-title" style="font-size:1.6rem;margin:0;line-height:1.1;">'
-        f'      Cast-a-shadow <span style="font-weight:400;font-size:1rem;'
-        f'      color:var(--muted);letter-spacing:0.04em;">beta</span></p>'
-        f'    <p style="font-size:0.78rem;color:var(--muted);margin:0.2rem 0 0;">'
-        f'      Automated perspective-shadow compositing for product images</p>'
-        f'  </div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def _mark_anchor(img: Image.Image, point: Tuple[int, int], on_dark: bool = False) -> Image.Image:
-    """
-    Returns a copy of img with a red crosshair drawn at point.
-    on_dark=True composites the image over a grey checkerboard so transparent
-    regions are visible (useful for the shadow whose background is empty).
-    """
-    # Checkerboard background makes alpha regions visible for the shadow panel
-    if on_dark:
-        tile = 12
-        bg = Image.new("RGBA", img.size, (180, 180, 180, 255))
-        for ty in range(0, img.height, tile):
-            for tx in range(0, img.width, tile):
-                if (tx // tile + ty // tile) % 2 == 0:
-                    box = (tx, ty, min(tx + tile, img.width), min(ty + tile, img.height))
-                    bg.paste((210, 210, 210, 255), box)
-        vis = bg
-        vis.paste(img, mask=img)
-    else:
-        vis = img.copy().convert("RGBA")
-
-    draw = ImageDraw.Draw(vis)
-    px, py = point
-    r  = max(6, min(18, img.width // 50))   # dot radius scales with image size
-    arm = r * 3                              # crosshair arm length
-
-    # Cross arms
-    draw.line([(px - arm, py), (px + arm, py)], fill=(255, 40, 40, 255), width=2)
-    draw.line([(px, py - arm), (px, py + arm)], fill=(255, 40, 40, 255), width=2)
-    # Filled circle
-    draw.ellipse([(px - r, py - r), (px + r, py + r)], fill=(255, 40, 40, 200))
-
-    return vis
-
-
-def render_debug(
-    prod_for_anchor: Image.Image,
-    shad_for_anchor: Image.Image,
-    p_anchor:        Optional[Tuple[int, int]],
-    s_anchor:        Optional[Tuple[int, int]],
-) -> None:
-    """Expander with visual anchor markers so misalignments are easy to spot."""
-    with st.expander("Anchor debug — click to verify anchor placement"):
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Product — bottom-left anchor**")
-            if p_anchor:
-                st.image(_mark_anchor(prod_for_anchor, p_anchor), use_container_width=True)
-                st.code(f"x={p_anchor[0]}, y={p_anchor[1]}")
-            else:
-                st.image(prod_for_anchor, use_container_width=True)
-                st.warning("Anchor not found")
-            st.caption(f"Image size: {prod_for_anchor.size}")
-        with c2:
-            st.markdown("**Shadow — bottom-right anchor**")
-            if s_anchor:
-                st.image(_mark_anchor(shad_for_anchor, s_anchor, on_dark=True),
-                         use_container_width=True)
-                st.code(f"x={s_anchor[0]}, y={s_anchor[1]}")
-            else:
-                st.image(shad_for_anchor, use_container_width=True)
-                st.warning("Anchor not found")
-            st.caption(f"Image size: {shad_for_anchor.size}")
-
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    shadow_scale, offset_x, offset_y, bg_tolerance, add_bg, bg_hex, margin_px = render_sidebar()
-    render_header()
-
-    # ── Upload inputs ──────────────────────────────────────────────────────
-    col_prod, col_shad = st.columns(2, gap="medium")
-
-    with col_prod:
-        st.markdown(
-            '<div class="section-label" style="min-height:1.6rem;display:flex;align-items:center;">'
-            'Product Image</div>',
-            unsafe_allow_html=True,
+        product_files = st.file_uploader(
+            "Product Images", type=["png", "jpg", "jpeg"],
+            label_visibility="collapsed", key="product_upload",
+            accept_multiple_files=True,
         )
-        product_file = st.file_uploader(
-            "product",
-            type=["png", "jpg", "jpeg"],
-            key="product",
-            label_visibility="collapsed",
-        )
-
-    with col_shad:
+    with col2:
         st.markdown(
-            '<div class="section-label" style="min-height:1.6rem;display:flex;align-items:center;gap:0.4rem;">'
-            'Shadow Image <span class="chip">optional</span></div>',
+            '<div style="height:1.55rem;display:flex;align-items:center;margin-bottom:0.35rem;">'
+            '<span class="section-label" style="margin-bottom:0;">Shadow Image</span>'
+            '&nbsp;<span class="chip">optional</span>'
+            '</div>',
             unsafe_allow_html=True,
         )
         shadow_file = st.file_uploader(
-            "shadow",
-            type=["png"],
-            key="shadow",
-            label_visibility="collapsed",
+            "Shadow Image", type=["png"],
+            label_visibility="collapsed", key="shadow_upload",
         )
 
-    # ── Resolve shadow source ──────────────────────────────────────────────
-    shadow_img: Optional[Image.Image] = None
-    shadow_label = ""
+    # ── Load shadow bytes (cached prepare_layers needs bytes, not PIL Image) ───
+    shadow_bytes: bytes | None = None
+    shadow_label = "default shadow"
+    if shadow_file:
+        shadow_bytes = shadow_file.getvalue()
+        shadow_label = shadow_file.name
+    elif os.path.exists("default_shadow.png"):
+        with open("default_shadow.png", "rb") as f:
+            shadow_bytes = f.read()
+        shadow_label = "default_shadow.png"
 
-    if shadow_file is not None:
-        shadow_img   = Image.open(shadow_file)
-        shadow_label = "Uploaded shadow"
+    if not product_files:
+        st.info("Upload one or more product images to get started.")
+        return
+
+    if shadow_bytes is None:
+        st.markdown(
+            '<p style="color:#727266;font-size:0.9rem;margin-top:1.2rem;">'
+            'No shadow uploaded and no <code>default_shadow.png</code> found. '
+            'Upload a shadow PNG above or place <code>default_shadow.png</code> here.</p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # ── Shared settings string ─────────────────────────────────────────────────
+    options_parts = []
+    if add_bg and bg_color_val:
+        options_parts.append(f"bg {bg_color_val}")
+    if out_margin:
+        options_parts.append(f"margin {out_margin}px")
+    options_str = " · ".join(options_parts) if options_parts else "default settings"
+
+    bg_color = bg_color_val if add_bg else None
+
+    # ── Run heavy stage for each file (cached) ─────────────────────────────────
+    spinner_slot = st.empty()
+    prepared: list[tuple] = []  # [(file, key, layers_or_None, err)]
+    n = len(product_files)
+
+    for i, f in enumerate(product_files):
+        spinner_slot.markdown(
+            f'<div class="cas-status"><span class="cas-ring"></span>'
+            f'Preparing {i + 1} / {n} — {f.name}</div>',
+            unsafe_allow_html=True,
+        )
+        key = getattr(f, "file_id", None) or f.name
+        try:
+            product_bytes = f.getvalue()
+            layers = _prepare_layers_cached(product_bytes, shadow_bytes, shadow_scale, bg_tolerance)
+            prepared.append((f, key, layers, ""))
+        except Exception as exc:
+            prepared.append((f, key, None, str(exc)))
+
+    spinner_slot.empty()
+
+    # ── Render results ─────────────────────────────────────────────────────────
+    if n == 1:
+        st.markdown(
+            f'<div class="result-card">'
+            f'<div class="section-label">Result — {shadow_label} · {options_str}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        f, key, layers, err = prepared[0]
+        if layers is None:
+            st.error(f"Compositing failed: {err}")
+            return
+        prod, shad, prod_anchor, shad_anchor = layers
+        stem = os.path.splitext(f.name)[0]
+        _render_result(
+            key, stem, prod, shad, prod_anchor, shad_anchor,
+            bg_color, out_margin, dl_key_suffix="single",
+        )
     else:
-        default = load_default_shadow()
-        if default is not None:
-            shadow_img   = default
-            shadow_label = f"Auto-loaded `{DEFAULT_SHADOW_FILE}`"
-
-    # ── Early exits ────────────────────────────────────────────────────────
-    if product_file is None:
         st.markdown(
-            '<p style="color:var(--muted);font-size:0.9rem;margin-top:0.5rem;">'
-            'Upload a product image above to get started.</p>',
+            f'<div class="result-card">'
+            f'<div class="section-label">Batch — {n} images · {shadow_label} · {options_str}</div>'
+            f'</div>',
             unsafe_allow_html=True,
         )
-        return
+        outputs: list[tuple[str, Image.Image]] = []
+        for i, (f, key, layers, err) in enumerate(prepared):
+            stem = os.path.splitext(f.name)[0]
+            st.markdown(
+                f'<div class="section-label" style="margin-top:1rem;">{stem}</div>',
+                unsafe_allow_html=True,
+            )
+            if layers is None:
+                st.error(f"Failed: {err}")
+                continue
+            prod, shad, prod_anchor, shad_anchor = layers
+            out_img = _render_result(
+                key, stem, prod, shad, prod_anchor, shad_anchor,
+                bg_color, out_margin, dl_key_suffix=f"batch_{i}",
+            )
+            outputs.append((f"{stem}_shadow.png", out_img))
 
-    if shadow_img is None:
-        st.markdown(
-            f'<p style="color:var(--muted);font-size:0.9rem;margin-top:0.5rem;">'
-            f'No shadow image uploaded and <code>{DEFAULT_SHADOW_FILE}</code> was not '
-            f'found in the app directory. Please upload a shadow PNG or add a default file.</p>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    # ── Load & composite ───────────────────────────────────────────────────
-    product_img = Image.open(product_file)
-
-    with st.spinner("Compositing…"):
-        result = composite(
-            product_img,
-            shadow_img,
-            shadow_scale=shadow_scale,
-            offset_x=offset_x,
-            offset_y=offset_y,
-            bg_tolerance=bg_tolerance,
-        )
-
-    # ── Apply output options ───────────────────────────────────────────────
-    # Work on a separate copy so the debug panel still sees the raw composite.
-    output = result
-
-    # Parse bg colour once so it's available for both the fill and margin steps
-    hx = bg_hex.lstrip("#")
-    bg_r, bg_g, bg_b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
-
-    if add_bg:
-        bg_canvas = Image.new("RGBA", output.size, (bg_r, bg_g, bg_b, 255))
-        bg_canvas.paste(output, mask=output)
-        output = bg_canvas
-
-    if margin_px > 0:
-        ow, oh = output.size
-        fill = (bg_r, bg_g, bg_b, 255) if add_bg else (0, 0, 0, 0)
-        margin_canvas = Image.new("RGBA", (ow + 2 * margin_px, oh + 2 * margin_px), fill)
-        margin_canvas.paste(output, (margin_px, margin_px))
-        output = margin_canvas
-
-    # ── Result display ─────────────────────────────────────────────────────
-    label_parts = [shadow_label]
-    if add_bg:
-        label_parts.append(f"bg {bg_hex}")
-    if margin_px:
-        label_parts.append(f"{margin_px}px margin")
-
-    st.markdown(
-        f'<div class="result-card">'
-        f'<div class="section-label">Result — {" · ".join(label_parts)}</div>',
-        unsafe_allow_html=True,
-    )
-    st.image(output, use_container_width=True)
-
-    # ── Recompute anchor inputs for the debug panel ───────────────────────
-    # Must mirror exactly what composite() does so the preview matches reality.
-    _prod = product_img.convert("RGBA")
-    if not has_transparency(_prod):
-        _prod = remove_solid_background(_prod, tolerance=bg_tolerance)
-    _prod = strip_baked_shadow(_prod)
-    _pbbox = _prod.getbbox()
-    if _pbbox:
-        _prod = _prod.crop(_pbbox)
-
-    _shad = shadow_img.convert("RGBA")
-    _sbbox = _shad.getbbox()
-    if _sbbox:
-        _shad = _shad.crop(_sbbox)
-
-    _pw = _prod.size[0]
-    _tw = max(1, int(_pw * shadow_scale))
-    _th = max(1, int(_tw * (_shad.height / _shad.width)))
-    _shad_scaled = _shad.resize((_tw, _th), Image.Resampling.LANCZOS)
-
-    render_debug(
-        _prod, _shad_scaled,
-        find_bottom_left_anchor(_prod),
-        find_bottom_right_anchor(_shad_scaled),
-    )
-
-    # ── Download ───────────────────────────────────────────────────────────
-    st.download_button(
-        label="Download PNG",
-        data=to_png_bytes(output),
-        file_name="product_with_shadow.png",
-        mime="image/png",
-        use_container_width=True,
-    )
+        if outputs:
+            st.markdown("---")
+            st.download_button(
+                f"Download all {len(outputs)} as ZIP",
+                data=create_zip(outputs),
+                file_name="cast_a_shadow_batch.zip",
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_zip",
+            )
 
 
-main()
+if __name__ == "__main__":
+    main()
