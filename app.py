@@ -15,7 +15,7 @@ SHADOW_RAY_ANGLE: float = 10.0   # shadow  bottom-right sweep — tune here
 
 # ── Page config (must be first Streamlit call) ─────────────────────────────────
 st.set_page_config(
-    page_title="Cast-a-shadow beta - Harvia Labs",
+    page_title="Shadowforge beta - Harvia Labs",
     page_icon="🌤️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1039,7 +1039,7 @@ def main() -> None:
             st.download_button(
                 f"Download all {len(outputs)} as ZIP",
                 data=create_zip(outputs),
-                file_name="cast_a_shadow_batch.zip",
+                file_name="product_images_shadow.zip",
                 mime="application/zip",
                 use_container_width=True,
                 key="dl_zip",
