@@ -595,9 +595,9 @@ def render_sidebar() -> tuple:
 
         st.markdown(
             '<div style="padding-top:0.8rem;margin-bottom:0.6rem;">'
-            '<div class="section-label" style="margin:0 0 0.25rem;">Global defaults</div>'
+            '<div class="section-label" style="margin:0 0 0.25rem;">Master settings</div>'
             '<p style="font-size:0.72rem;margin:0;line-height:1.4;">'
-            'These apply to every image. Use the debug panel under each result to override per image.'
+            'If you upload multiple images, these apply to all of them. Use the debug panel under each result to override per image.'
             '</p></div>',
             unsafe_allow_html=True,
         )
@@ -661,10 +661,10 @@ def render_header() -> None:
   {logo_html}
   <div style="border-left:2px solid #D9D6C8;padding-left:0.8rem;">
     <div style="font-family:'Gotham','Barlow',sans-serif;font-weight:700;font-size:1.6rem;color:#505045;line-height:1.2;">
-      Cast-a-shadow
+      Shadowforge
       <span style="font-family:'Chevin Pro','Barlow',sans-serif;font-size:1rem;color:#727266;letter-spacing:0.04em;font-weight:400;"> beta</span>
     </div>
-    <div style="font-size:0.78rem;color:#727266;margin-top:0.15rem;">Automated perspective-shadow compositing for product images</div>
+    <div style="font-size:0.78rem;color:#727266;margin-top:0.15rem;">Automatically applies shadows to product images</div>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -673,19 +673,19 @@ def render_header() -> None:
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem 2rem;padding:0.25rem 0 1.1rem;">
 <div>
 <div class="section-label">1 · Background removal</div>
-<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">Corner pixels are sampled to detect the background colour. A BFS flood-fill from all four edges builds a mask, and a Gaussian-smoothed trimap blend removes the background while preserving semi-transparent edges.</p>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">If the product image is not transparent the tool removes the background automatically. You can change the tolerance in the left sidebar.</p>
 </div>
 <div>
-<div class="section-label">2 · Floor contact anchor</div>
-<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">A sweep line at 30° from vertical scans all solid product pixels. The pixel with the lowest projection value — furthest left <em>and</em> down — is chosen as the floor contact point. This reliably finds the bottom-left corner regardless of product shape.</p>
+<div class="section-label">2 · Locating the product's bottom corner</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">A sweep line at 30° angle scans all solid product pixels moving in from the bottom left. The pixel colliding with that line first is chosen as the bottom-left corner.</p>
 </div>
 <div>
-<div class="section-label">3 · Shadow anchor</div>
-<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The same ray-sweep logic at 10° from vertical finds the shadow's bottom-right floor contact point — the pixel furthest right and down. Both angles are tunable constants in the code.</p>
+<div class="section-label">3 · Locating the shadow anchor</div>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The same sweep logic at 10° from bottom right finds the anchor point for the shadow.</p>
 </div>
 <div>
 <div class="section-label">4 · Compositing</div>
-<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The two anchors are aligned on a shared canvas — the shadow behind, the product on top. Shadow width scales as a multiple of the product bounding-box width. Each result has its own X/Y micro-adjustment in the debug panel for fine-tuning.</p>
+<p style="font-size:0.85rem;color:#505045;margin:0.3rem 0 0;">The two anchors are aligned on a shared canvas. Shadow width scales as a multiple of the product bounding-box width. Each result has its own X/Y micro-adjustment in the debug panel for fine-tuning.</p>
 </div>
 </div>
 """, unsafe_allow_html=True)
